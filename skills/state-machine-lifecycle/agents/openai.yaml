@@ -1,0 +1,4 @@
+interface:
+  display_name: "State Machine Lifecycle"
+  short_description: "State-machine PRD, AgentTeam, test gates"
+  default_prompt: "Use $state-machine-lifecycle to turn this product idea into a state-machine PRD and AgentTeam plan."

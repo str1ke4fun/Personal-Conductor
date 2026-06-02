@@ -1,0 +1,83 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Personal Conductor",
+  "version": "0.1.0",
+  "identifier": "local.personal.conductor",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://127.0.0.1:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "pet",
+        "url": "index.html",
+        "width": 320,
+        "height": 420,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": true
+      },
+      {
+        "label": "tasks",
+        "url": "tasks.html",
+        "width": 400,
+        "height": 500,
+        "transparent": false,
+        "decorations": true,
+        "title": "任务面板",
+        "alwaysOnTop": true,
+        "skipTaskbar": false,
+        "visible": false
+      },
+      {
+        "label": "chat",
+        "url": "chat.html",
+        "width": 450,
+        "height": 600,
+        "transparent": false,
+        "decorations": true,
+        "title": "对话面板",
+        "alwaysOnTop": true,
+        "skipTaskbar": false,
+        "visible": false
+      },
+      {
+        "label": "settings",
+        "url": "settings.html",
+        "width": 450,
+        "height": 700,
+        "transparent": false,
+        "decorations": true,
+        "title": "设置面板",
+        "alwaysOnTop": true,
+        "skipTaskbar": false,
+        "visible": false
+      },
+      {
+        "label": "workbench",
+        "url": "workbench.html",
+        "width": 1100,
+        "height": 720,
+        "transparent": false,
+        "decorations": true,
+        "title": "工作台",
+        "alwaysOnTop": false,
+        "skipTaskbar": false,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false,
+    "targets": "all",
+    "resources": ["resources/live2d/**/*"]
+  }
+}

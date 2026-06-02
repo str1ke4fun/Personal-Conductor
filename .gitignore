@@ -1,0 +1,60 @@
+# OS and editor noise
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local agent / workspace state
+.acceptance/
+.claude/
+.codex/
+.trae/
+state/
+docs/.claude/
+
+# Dependencies and build output
+node_modules/
+apps/desktop/node_modules/
+apps/desktop/dist/
+target/
+target-*/
+
+# Release artifacts
+release/_build/
+release/app/
+release/bin/
+release/docs/
+release/resources/
+release/state/
+release/state-template/conductor.sqlite
+release/state-template/conductor.sqlite-*
+Personal-Conductor-*.zip
+/*.zip
+
+# SQLite, logs, and transient runtime files
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.ndjson
+*.log
+*.err.log
+*.out.log
+
+# Local experiments and asset workspaces
+2Dworkspace/
+live2d-automation-master/
+tools/
+agent_proxy_traffic.db
+/codex-*.exe
+
+# Model caches and local test files
+**/.fastembed_cache/
+test_*.md
+test_*.json
+apps/desktop/src-tauri/test_document.md
+
+# Large docs-side media that is not needed for source distribution
+docs/*.mp4
+docs/*.png
+docs/*.jpg
+docs/*.jpeg

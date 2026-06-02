@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/conductor-core",
+    "crates/conductor-cli",
+    "crates/conductor-sense",
+    "apps/desktop/src-tauri",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.78"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "io-std", "process", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "1"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+clap = { version = "4", features = ["derive"] }
+fs4 = { version = "0.8", features = ["tokio"] }
+walkdir = "2"
+glob = "0.3"
+lazy_static = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+tempfile = "3"
+filetime = "0.2"
+sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "chrono", "uuid", "migrate"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+axum = { version = "0.8" }
+regex = "1"
+async-trait = "0.1"
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-build = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-dialog = "2"
+notify = "6"
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_Graphics_Gdi",
+] }

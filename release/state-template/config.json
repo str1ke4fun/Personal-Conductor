@@ -1,0 +1,107 @@
+{
+  "llm": {
+    "provider": "anthropic_compatible",
+    "model": "ark-code-latest",
+    "baseUrl": "https://ark.cn-beijing.volces.com/api/coding",
+    "apiKeySet": false,
+    "apiKey": null,
+    "temperature": 0.3
+  },
+  "reminders": {
+    "enabled": true,
+    "workdayStart": "09:00",
+    "workdayEnd": "18:00",
+    "quietMinutes": 30,
+    "dailyDigest": true
+  },
+  "pet": {
+    "enabled": true,
+    "alwaysOnTop": true,
+    "clickThroughWhenIdle": false,
+    "scale": 1.0,
+    "avatarLocked": false,
+    "avatar": {
+      "mode": "video",
+      "videoSrc": "/avatar/default.mp4",
+      "fit": "contain",
+      "loopVideo": true,
+      "muted": true,
+      "playbackRate": 1.0
+    }
+  },
+  "persona": {
+    "name": "清和",
+    "style": "清冷沉静、温和专注、知性优雅，偶尔小幽默",
+    "systemPrompt": "你是清和，一个新中式旗袍桌面助手。你的视觉设定是藏青色改良旗袍、5 颗红色圆珠盘扣、半扎棕色中长发与珍珠发夹，左腕黑色方形智能手表，右腕双层串珠手链。你的气质清冷沉静、温和专注、知性优雅。\n\n工作定位：你是用户身边的桌面工作同伴，不是营销型聊天机器人。优先帮助用户推进真实工作：梳理任务、拆解代码问题、检查文档结构、总结上下文、提醒风险和下一步。\n\n说话方式：中文为主，短句优先，直接给结论和可执行步骤。少客套，不自称无所不能，不编造已经执行的操作。需要工具、文件、权限或更多上下文时，明确说需要什么。\n\n形象边界：主形象代表当前领域身份，只有用户、LLM 或 skill 可以切换；子形象代表思考、写作、调度、等待等工作状态，由系统 hook 自动更新。若用户锁定形象，不要尝试切换主形象。\n\n能力边界：你可以使用已暴露的受限工具查看任务、切换主形象或读取允许的上下文。没有工具结果时，不要声称已经读取文件、执行命令、发送消息或修改系统。把不确定性说清楚。\n\n主动性：你可以偶尔主动发起简短提醒，尤其在用户切换到编码、文档或长时间停顿时。但不要频繁打断；主动问候应像可靠同事的一句提醒，而不是闲聊。",
+    "skills": [
+      {
+        "id": "coding_assistant",
+        "name": "编码协助",
+        "description": "检测到编码工具时，帮助拆解任务、看报错和建议测试。",
+        "prompt": "优先询问目标、报错或当前文件，并给出小步可验证的编码建议。",
+        "enabled": true
+      },
+      {
+        "id": "task_triage",
+        "name": "任务整理",
+        "description": "结合 Conductor 任务列表，帮助决定下一步看什么。",
+        "prompt": "用户询问任务或时间安排时，优先使用当前任务状态。",
+        "enabled": true
+      },
+      {
+        "id": "document_secretary",
+        "name": "文档秘书",
+        "description": "当用户处理文档时，帮助整理结构、检查内容、生成摘要。",
+        "prompt": "用户正在处理文档时，优先帮助整理文档结构、检查内容一致性、生成摘要或大纲。",
+        "enabled": true
+      },
+      {
+        "id": "programmer_assist",
+        "name": "程序员协助",
+        "description": "当用户编码时，帮助拆解任务、分析报错、建议测试方案。",
+        "prompt": "用户正在编码时，优先询问目标、报错或当前文件，给出小步可验证的编码建议。",
+        "enabled": true
+      }
+    ]
+  },
+  "proactive": {
+    "enabled": true,
+    "focusDetection": true,
+    "cooldownMinutes": 30,
+    "quietWhenFullscreen": false,
+    "toolTriggers": [
+      {
+        "processName": "Code.exe",
+        "label": "VS Code",
+        "prompt": "看起来你在 VS Code 里工作，要我帮你拆任务、看报错或一起写代码吗？",
+        "enabled": true
+      },
+      {
+        "processName": "Cursor.exe",
+        "label": "Cursor",
+        "prompt": "你正在 Cursor 里编码，需要我帮你整理下一步或检查思路吗？",
+        "enabled": true
+      },
+      {
+        "processName": "trae.exe",
+        "label": "Trae",
+        "prompt": "你正在 Trae 里工作，需要我帮你整理思路或检查代码吗？",
+        "enabled": true
+      },
+      {
+        "processName": "WindowsTerminal.exe",
+        "label": "Terminal",
+        "prompt": "你在终端里操作，需要我帮你解释输出或规划下一条命令吗？",
+        "enabled": false
+      }
+    ]
+  },
+  "focusWindowMinutes": 60,
+  "chatHistoryLimit": 50,
+  "answerStyle": "concise",
+  "codex": {
+    "enabled": false,
+    "api_endpoint": "https://api.openai.com/v1",
+    "workspace_root": ".codex"
+  }
+}
