@@ -611,7 +611,7 @@ export function AgentWorkspacePanel() {
             <button
               type="button"
               className="workbench-btn"
-              onClick={() => void appWindow.close()}
+              onClick={() => void appWindow.hide()}
               title="关闭工作台"
             >
               ✕

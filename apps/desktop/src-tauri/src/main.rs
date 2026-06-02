@@ -15,7 +15,7 @@ use conductor_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -166,6 +166,21 @@ fn stop_runtime_api(app: &AppHandle) {
     });
 }
 
+fn install_auxiliary_window_close_handlers(app: &AppHandle) {
+    for label in ["tasks", "chat", "settings", "workbench"] {
+        let Some(window) = app.get_webview_window(label) else {
+            continue;
+        };
+        let window_handle = window.clone();
+        window.on_window_event(move |event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window_handle.hide();
+            }
+        });
+    }
+}
+
 fn main() {
     #[cfg(debug_assertions)]
     let _dev_server = dev_server::ensure_vite_dev_server();
@@ -191,6 +206,7 @@ fn main() {
             worker::spawn(app.handle().clone());
             cursor::spawn_cursor_watcher(app.handle().clone());
             window_state::apply_pet_window_state(app.handle());
+            install_auxiliary_window_close_handlers(app.handle());
             if let Some(pet) = app.get_webview_window("pet") {
                 let _ = set_pet_click_through(pet, false);
             }

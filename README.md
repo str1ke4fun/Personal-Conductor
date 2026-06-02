@@ -1,16 +1,19 @@
 # Personal Conductor
 
-Personal Conductor is a Windows-first desktop companion for coding, task triage, and lightweight agent orchestration.
-It combines a Tauri desktop shell, a React frontend, a Rust core, local SQLite persistence, and avatar-driven status rendering for an always-on assistant experience.
+[中文说明](README.zh-CN.md)
 
-## What It Does
+![Qinghe desk companion](apps/desktop/public/avatar/document_secretary/shy.png)
 
-- Floating desktop companion with tray integration and multiple work surfaces.
-- Task, chat, settings, and workbench windows backed by a shared runtime.
-- Local task, chat, memory, and goal state stored in SQLite.
-- Hook-friendly CLI for external tooling and automation flows.
-- Live2D and avatar asset pipeline for status-aware visual presentation.
-- Portable Windows packaging flow for internal release builds.
+Personal Conductor is a Windows-first desktop pet companion for coding, task follow-up, and lightweight workspace assistance.
+It combines a Tauri desktop shell, a React frontend, a Rust core, local persistence, and avatar-driven status rendering into a desk-side assistant that stays visible while you work.
+
+## What It Is
+
+- A floating desktop pet with tray integration and multiple companion panels
+- A workbench window for chat, goals, and task context
+- Local-first runtime state stored in SQLite under `state/`
+- Avatar and Live2D assets for status-aware presentation
+- Portable packaging flow for internal Windows releases
 
 ## Repository Layout
 
@@ -24,106 +27,52 @@ release/               Portable release skeleton and release docs
 scripts/               Build, packaging, and local helper scripts
 ```
 
-## Development Environment
+## Development
 
-- OS: Windows 10/11 x64
-- Rust toolchain: stable, workspace edition 2021
-- Node.js: 20+ recommended
-- npm: required for the desktop frontend
+Requirements:
 
-## Run In Development
+- Windows 10/11 x64
+- Rust stable
+- Node.js 20+
+- npm
+
+Start development mode:
 
 ```powershell
 .\dev.ps1
 ```
 
-Alternative entrypoints:
-
-- `start-dev.bat`
-- `cd apps/desktop && npm run build`
-- `cargo build -p conductor-cli`
-- `cargo build -p conductor-desktop`
-
-The development launchers set `CONDUCTOR_ROOT` to the repository root so runtime state is written under `state/`.
-
-## Build
-
-Frontend:
+Useful commands:
 
 ```powershell
 cd apps\desktop
 npm run build
+
+cargo build -p conductor-cli
+cargo build -p conductor-desktop
 ```
 
-CLI:
+## Portable Builds
 
-```powershell
-cargo build --release -p conductor-cli
-```
-
-Desktop:
-
-```powershell
-cargo build --release -p conductor-desktop -j 1
-```
-
-`-j 1` is currently the safer release build setting for this workspace on Windows.
-
-## Portable Packaging
-
-The repository includes a repeatable portable packaging script:
+Create the standard portable zip:
 
 ```powershell
 .\scripts\package-portable.ps1
 ```
 
-This script will:
-
-- build the frontend
-- build release binaries
-- generate a clean SQLite baseline with schema
-- sanitize release state
-- sync assets into `release/`
-- create a portable zip in the repository root
-
-The latest generated internal package is expected to look like:
-
-```text
-Personal-Conductor-v0.1.0-internal-YYYYMMDD-HHMM.zip
-```
-
-## Portable Startup
-
-For packaged builds, start the app through:
-
-```text
-release\启动 Personal Conductor.cmd
-```
-
-That launcher sets `CONDUCTOR_ROOT` to the extracted release directory and bootstraps `state/` from `state-template/` when needed.
+Packaged builds bootstrap runtime data from `release/state-template/` and then write fresh local data into `state/`.
 
 ## Runtime Data
 
-Runtime state is local-first and includes:
+Runtime state is intentionally local and should not be committed:
 
 - `state/conductor.sqlite`
 - `state/config.json`
 - `state/events.ndjson`
 - `state/summaries/`
 
-These files are intentionally excluded from source control.
-
-## CI
-
-GitHub Actions CI is defined in `.github/workflows/ci.yml` and currently runs:
-
-- `cargo fmt --all -- --check`
-- `cargo clippy --workspace -- -D warnings`
-- `cargo test --workspace`
-- frontend type-check and Vitest
-
 ## Notes
 
 - This project is currently Windows-focused.
-- Public installer packaging is not fully wired yet; the portable release flow is the current supported distribution route.
-- Local secrets, conversation history, and memory state should not be committed.
+- The current distribution route is the portable zip package, not a full installer.
+- Release packages should be sanitized before distribution so they do not include local chat history, memory state, or test residue.

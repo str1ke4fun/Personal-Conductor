@@ -43,7 +43,7 @@ Personal-Conductor-*.zip
 # Local experiments and asset workspaces
 2Dworkspace/
 live2d-automation-master/
-tools/
+/tools/
 agent_proxy_traffic.db
 /codex-*.exe
 
