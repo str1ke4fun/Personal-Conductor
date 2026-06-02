@@ -2,7 +2,7 @@
 
 [English README](README.md)
 
-![清和桌宠](apps/desktop/public/avatar/document_secretary/shy.png)
+![清和桌宠](apps/desktop/public/avatar/document_secretary/board-doc-relex.png)
 
 Personal Conductor 是一个面向 Windows 的桌宠式桌面搭子。
 它把 Tauri 桌面壳、React 前端、Rust 核心、本地 SQLite 状态，以及头像 / Live2D 渲染组合在一起，让一个常驻桌面的助手陪着用户处理编码、任务跟进和工作台对话。

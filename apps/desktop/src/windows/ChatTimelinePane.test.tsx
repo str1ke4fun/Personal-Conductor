@@ -343,8 +343,8 @@ describe('ChatTimelinePane', () => {
       />,
     );
 
-    expect(screen.getByText('把当前工作直接交给它')).toBeTruthy();
-    expect(screen.getByText('读代码并解释')).toBeTruthy();
+    expect(screen.getByText('描述一个问题，或者贴段代码')).toBeTruthy();
+    expect(screen.getByText('切到目标模式，交给她执行一个长任务')).toBeTruthy();
     expect(screen.queryByText(/短问题会直接在聊天里完成/)).toBeNull();
   });
 

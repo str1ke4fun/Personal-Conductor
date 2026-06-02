@@ -2,7 +2,7 @@
 
 [中文说明](README.zh-CN.md)
 
-![Qinghe desk companion](apps/desktop/public/avatar/document_secretary/shy.png)
+![Qinghe desk companion](apps/desktop/public/avatar/document_secretary/board-doc-relex.png)
 
 Personal Conductor is a Windows-first desktop pet companion for coding, task follow-up, and lightweight workspace assistance.
 It combines a Tauri desktop shell, a React frontend, a Rust core, local persistence, and avatar-driven status rendering into a desk-side assistant that stays visible while you work.
