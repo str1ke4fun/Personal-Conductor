@@ -1,6 +1,8 @@
 # Docs 文件索引
 
-> 最后更新: 2026-05-31 | 由文档同步助手维护 (增量扫描)
+> 最后更新: 2026-06-07 | 由文档同步助手维护（代码细读同步）
+> 上一次扫描: 2026-06-06（Goal 会话 + Shell 权限 + 推理图收口），详见 [wiki/18-维护记录-权限与推理图-20260606.md](../wiki/18-维护记录-权限与推理图-20260606.md)
+> 本次同步: 2026-06-07（Graph Snapshot 字段补齐 + `tick_goal` + `goal_hints` + `chat/turns.rs` 模块化），详见 [wiki/19-维护记录-代码同步与图快照-20260607.md](../wiki/19-维护记录-代码同步与图快照-20260607.md)
 > 同步状态详情见 [文档同步状态-20260527.md](文档同步状态-20260527.md)
 > Release 包见 [release/INDEX.md](../release/INDEX.md)
 
@@ -8,7 +10,8 @@
 
 ## 近期代码变更 (自动检测)
 
-> 扫描时间: 2026-05-29 ~01:30 | Round 4 已实现 | 47 个工具注册 | 65 个前端 invoke / 62 个后端 command | 234 测试全通过 | AUDIT-005 工作区路径感知 | AUDIT-007 会话隔离修复 | AUDIT-008 桌宠状态协调器 | 会话切换端到端打通
+> 扫描时间: 2026-06-07 | 增量扫描 | 已对齐：Graph Snapshot `chat_turn_request_ids`/`chat_turns` 字段、`GoalOrchestrator::tick_goal` + observe 防抖、`commands.rs::get_goal_graph` 真实实现、`goal_hints` 模块、`chat/turns.rs` 模块化、`model_resolver` / `user_presence` 新增模块。
+> 历史快照: 2026-05-29 ~01:30 | Round 4 已实现 | 47 个工具注册 | 65 个前端 invoke / 62 个后端 command | 234 测试全通过 | AUDIT-005 工作区路径感知 | AUDIT-007 会话隔离修复 | AUDIT-008 桌宠状态协调器 | 会话切换端到端打通
 
 ### 已验证修复 (外部 agent 完成)
 
@@ -35,6 +38,13 @@
 | `conductor-core/src/workspaces.rs` | **新增** (386 行) | 当前架构说明 |
 | `conductor-core/src/mcp.rs` | 重写 (974 行) | 技术架构、AUDIT-004 |
 | `conductor-core/src/codex.rs` | 修改 (756 行) | codex session 管理从 stub 变为真实实现 |
+| `conductor-core/src/goal_hints.rs` | **新增** (2026-06-07) | wiki 05 §5.8.1、wiki 19 |
+| `conductor-core/src/chat/turns.rs` | **新增** (2026-06-07，独立模块化) | wiki 14 §14.5a、wiki 19 |
+| `conductor-core/src/model_resolver.rs` | **新增** (2026-06-07) | wiki 19 跟进项 |
+| `conductor-core/src/user_presence.rs` | **新增** (2026-06-07) | wiki 19 跟进项 |
+| `conductor-core/src/goal_orchestrator/mod.rs` | 修改 (2026-06-07，新增 `tick_goal` + `compute_observe_hash` 防抖) | wiki 05 §5.8、wiki 14 |
+| `conductor-core/src/runtime_api.rs` | 修改 (2026-06-07，`GoalGraphSnapshot` 扩展 `chat_turn_request_ids`/`chat_turns` 字段) | wiki 13、wiki 14 §14.5a |
+| `apps/desktop/src-tauri/src/commands.rs` | 修改 (2026-06-07，`get_goal_graph` 改为真实实现) | wiki 14 §14.5a |
 
 **`smart_monitor.rs` 说明**: LLM 驱动的智能监控决策器，替代原 `notify_decider.rs` 的硬编码逻辑。通过 gather_context() 收集告警/任务/心情/好感度/对话上下文，调用 LLM 判断是否通知用户及通知方式。含 fallback 降级逻辑。`notify_decider.rs` 已成为死代码。
 
@@ -103,6 +113,8 @@ docs/
 │   ├── 用户侧Agent使用场景与状态机模型-20260531.md  📋 新增建模
 │   ├── LLM工具与多Agent执行状态机模型-20260531.md  📋 新增建模
 │   ├── Agent场景状态机现状差距与整改问题-20260531.md  📋 新增审查
+│   ├── hybrid-model-dispatch-inproject-plan-20260604.md  🟡 方案待评审
+│   ├── hybrid-model-dispatch-mcpserver-plan-20260604.md  🟡 方案待评审
 │   ├── 感知层增强-主形象与子形象状态方案-20260526.md  🟡 部分完成
 │   ├── 角色表达与智能增强-机制设计-20260527.md   🟡 部分完成
 │   └── 表情状态机与资产规划-20260527.md    🟡 部分完成
@@ -163,6 +175,8 @@ docs/
 | 文档 | 状态 | 最后修改 | 说明 |
 |------|------|----------|------|
 | [MVP-实施方案.md](MVP-实施方案.md) | ✅ 完全同步 | 2026-05-22 | 最小闭环已实现，6 验收标准全部满足 |
+| [hybrid-model-dispatch-inproject-plan-20260604.md](hybrid-model-dispatch-inproject-plan-20260604.md) | 🟡 方案待评审 | 2026-06-04 | 混合模型指派·项目内接入(Plan 1)：ModelResolver 复用悬空 routing/profile 层，H1-H7，MVP=Claude规划+Doubao感知 |
+| [hybrid-model-dispatch-mcpserver-plan-20260604.md](hybrid-model-dispatch-mcpserver-plan-20260604.md) | 🟡 方案待评审 | 2026-06-04 | 混合模型指派·MCP Server 抽离(Plan 2)：复用 mcp.rs 帧/类型倒转方向做 server，暴露 model.route/list/invoke 给 Claude/Codex，M1-M6 |
 | [派工-Round1-MVP管道.md](派工-Round1-MVP管道.md) | ✅ 完全同步 | 2026-05-22 | T1-T11 全部实现 |
 | [派工-Round2-桌面壳与Live2D集成.md](派工-Round2-桌面壳与Live2D集成.md) | ✅ 完全同步 | 2026-05-22 | T1-T10 全部实现 |
 | [派工-Round3-感知层与反向控制.md](派工-Round3-感知层与反向控制.md) | ✅ 完全同步 | 2026-05-22 | T1-T10 全部实现 (T10 需人工验证) |

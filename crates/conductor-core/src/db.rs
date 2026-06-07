@@ -288,6 +288,120 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     .await?;
     // Migration: link a chat session to its associated goal (when kind = 'goal').
     ensure_column(pool, "chat_sessions", "goal_id", "goal_id TEXT").await?;
+    ensure_column(pool, "chat_messages", "turn_id", "turn_id TEXT").await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS chat_turns (
+          id TEXT PRIMARY KEY,
+          session_id TEXT,
+          projection_session_id TEXT,
+          workspace_id TEXT,
+          request_id TEXT NOT NULL UNIQUE,
+          initiator_kind TEXT NOT NULL DEFAULT 'user',
+          task_mode TEXT NOT NULL DEFAULT 'short',
+          capability TEXT NOT NULL DEFAULT 'ask_write',
+          status TEXT NOT NULL DEFAULT 'received',
+          stage TEXT,
+          user_message_id TEXT,
+          assistant_message_id TEXT,
+          llm_round_count INTEGER NOT NULL DEFAULT 0,
+          tool_run_count INTEGER NOT NULL DEFAULT 0,
+          active_tool_count INTEGER NOT NULL DEFAULT 0,
+          projection_status TEXT NOT NULL DEFAULT 'pending',
+          memory_status TEXT NOT NULL DEFAULT 'pending',
+          model_provider TEXT,
+          model_name TEXT,
+          error TEXT,
+          started_at TEXT NOT NULL,
+          finished_at TEXT,
+          metadata_json TEXT NOT NULL DEFAULT '{}',
+          goal_cycle_id TEXT,
+          agent_task_id TEXT,
+          goal_id TEXT
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS chat_turn_events (
+          id TEXT PRIMARY KEY,
+          turn_id TEXT NOT NULL,
+          session_id TEXT,
+          workspace_id TEXT,
+          request_id TEXT NOT NULL,
+          seq INTEGER NOT NULL,
+          event_type TEXT NOT NULL,
+          phase TEXT,
+          actor_kind TEXT NOT NULL DEFAULT 'system',
+          actor_id TEXT,
+          payload_json TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS chat_message_projections (
+          id TEXT PRIMARY KEY,
+          turn_id TEXT NOT NULL,
+          message_id TEXT,
+          session_id TEXT,
+          workspace_id TEXT,
+          role TEXT NOT NULL,
+          projection_kind TEXT NOT NULL,
+          status TEXT NOT NULL,
+          visibility TEXT NOT NULL DEFAULT 'visible',
+          plain_text TEXT,
+          content_blocks_json TEXT NOT NULL DEFAULT '[]',
+          source_event_id TEXT,
+          seq INTEGER NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS memory_candidates (
+          id TEXT PRIMARY KEY,
+          turn_id TEXT NOT NULL,
+          session_id TEXT,
+          workspace_id TEXT,
+          source_message_id TEXT,
+          source_projection_id TEXT,
+          source_tool_call_id TEXT,
+          memory_kind TEXT NOT NULL,
+          scope_kind TEXT NOT NULL,
+          scope_ref TEXT,
+          path_prefix TEXT,
+          key TEXT NOT NULL,
+          value_json TEXT NOT NULL DEFAULT '{}',
+          summary TEXT NOT NULL,
+          evidence_json TEXT NOT NULL DEFAULT '{}',
+          extractor_kind TEXT NOT NULL DEFAULT 'rule',
+          extractor_provider TEXT,
+          extractor_model TEXT,
+          confidence REAL NOT NULL DEFAULT 0.0,
+          status TEXT NOT NULL DEFAULT 'proposed',
+          dedupe_key TEXT NOT NULL,
+          promoted_memory_entry_id TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
 
     sqlx::query(
         r#"
@@ -317,6 +431,101 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     .await?;
 
     sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_chat_messages_turn ON chat_messages(turn_id, seq ASC);",
+    )
+    .execute(pool)
+    .await?;
+
+    // Migration: add goal/cycle/task anchor columns to chat_turns (BC-1)
+    ensure_column(pool, "chat_turns", "goal_cycle_id", "goal_cycle_id TEXT").await?;
+    ensure_column(pool, "chat_turns", "agent_task_id", "agent_task_id TEXT").await?;
+    ensure_column(pool, "chat_turns", "goal_id", "goal_id TEXT").await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_chat_turns_session ON chat_turns(session_id, started_at DESC);",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_chat_turns_projection_session ON chat_turns(projection_session_id, started_at DESC);",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_chat_turns_workspace ON chat_turns(workspace_id, started_at DESC);",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_chat_turns_status ON chat_turns(status, started_at DESC);",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_turn_events_turn_seq ON chat_turn_events(turn_id, seq);",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_chat_turn_events_request ON chat_turn_events(request_id, created_at ASC);",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_chat_turn_events_session ON chat_turn_events(session_id, created_at ASC);",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_chat_turn_events_type ON chat_turn_events(event_type, created_at DESC);",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_chat_msg_proj_turn ON chat_message_projections(turn_id, seq ASC);",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_chat_msg_proj_session ON chat_message_projections(session_id, seq ASC);",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_chat_msg_proj_message ON chat_message_projections(message_id);",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_chat_msg_proj_status ON chat_message_projections(status, updated_at DESC);",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_memory_candidates_turn ON memory_candidates(turn_id, created_at ASC);",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_memory_candidates_workspace ON memory_candidates(workspace_id, created_at DESC);",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_memory_candidates_status ON memory_candidates(status, updated_at DESC);",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_memory_candidates_dedupe ON memory_candidates(dedupe_key);",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS affection_state (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -339,13 +548,23 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
           category TEXT NOT NULL,
           scope TEXT NOT NULL DEFAULT 'global',
           workspace_id TEXT,
+          path_prefix TEXT,
+          source_session_id TEXT,
+          source_turn_id TEXT,
+          source_message_id TEXT,
+          source_projection_id TEXT,
+          source_tool_call_id TEXT,
+          goal_id TEXT,
           source TEXT NOT NULL DEFAULT 'user_confirmed',
           confidence REAL NOT NULL DEFAULT 1.0,
           sensitivity TEXT NOT NULL DEFAULT 'normal',
           expires_at TEXT,
           last_used_at TEXT,
+          status TEXT NOT NULL DEFAULT 'active',
           created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL
+          updated_at TEXT NOT NULL,
+          interaction_count INTEGER NOT NULL DEFAULT 0,
+          last_reinforced_at TEXT
         );
         "#,
     )
@@ -360,6 +579,43 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     )
     .await?;
     ensure_column(pool, "memory_entries", "workspace_id", "workspace_id TEXT").await?;
+    ensure_column(pool, "memory_entries", "path_prefix", "path_prefix TEXT").await?;
+    ensure_column(
+        pool,
+        "memory_entries",
+        "source_session_id",
+        "source_session_id TEXT",
+    )
+    .await?;
+    ensure_column(
+        pool,
+        "memory_entries",
+        "source_turn_id",
+        "source_turn_id TEXT",
+    )
+    .await?;
+    ensure_column(
+        pool,
+        "memory_entries",
+        "source_message_id",
+        "source_message_id TEXT",
+    )
+    .await?;
+    ensure_column(
+        pool,
+        "memory_entries",
+        "source_projection_id",
+        "source_projection_id TEXT",
+    )
+    .await?;
+    ensure_column(
+        pool,
+        "memory_entries",
+        "source_tool_call_id",
+        "source_tool_call_id TEXT",
+    )
+    .await?;
+    ensure_column(pool, "memory_entries", "goal_id", "goal_id TEXT").await?;
     ensure_column(
         pool,
         "memory_entries",
@@ -390,6 +646,20 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
         "status TEXT NOT NULL DEFAULT 'active'",
     )
     .await?;
+    ensure_column(
+        pool,
+        "memory_entries",
+        "interaction_count",
+        "interaction_count INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    ensure_column(
+        pool,
+        "memory_entries",
+        "last_reinforced_at",
+        "last_reinforced_at TEXT",
+    )
+    .await?;
 
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_memory_key ON memory_entries(key);")
         .execute(pool)
@@ -408,6 +678,19 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     )
     .execute(pool)
     .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_memory_path_prefix ON memory_entries(path_prefix);",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_memory_source_session ON memory_entries(source_session_id);",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_memory_goal ON memory_entries(goal_id);")
+        .execute(pool)
+        .await?;
 
     sqlx::query(
         r#"
@@ -853,6 +1136,7 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     .await?;
 
     ensure_column(pool, "tool_calls", "workspace_id", "workspace_id TEXT").await?;
+    ensure_column(pool, "tool_calls", "turn_id", "turn_id TEXT").await?;
     ensure_column(
         pool,
         "tool_calls",
@@ -874,6 +1158,12 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_tool_calls_session ON tool_calls(session_id);")
         .execute(pool)
         .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_tool_calls_turn ON tool_calls(turn_id, started_at ASC);",
+    )
+    .execute(pool)
+    .await?;
 
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_tool_calls_workspace ON tool_calls(workspace_id);")
         .execute(pool)
@@ -1201,11 +1491,51 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
             orientation_json TEXT,
             dispatch_plan_id TEXT,
             review_summary_ref TEXT,
+            last_graph_hash TEXT,
             started_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             finished_at TEXT
         );
         "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Migration: add last_graph_hash to existing goal_cycles rows
+    ensure_column(
+        pool,
+        "goal_cycles",
+        "last_graph_hash",
+        "last_graph_hash TEXT",
+    )
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS goal_hints (
+            id TEXT PRIMARY KEY,
+            goal_id TEXT NOT NULL,
+            cycle_id TEXT,
+            kind TEXT NOT NULL DEFAULT 'user',
+            content TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            expires_at TEXT
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_goal_hints_goal_status ON goal_hints(goal_id, status, created_at DESC);",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_goal_hints_cycle ON goal_hints(cycle_id, created_at DESC);",
     )
     .execute(pool)
     .await?;
@@ -1466,6 +1796,7 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
           id TEXT PRIMARY KEY,
           name TEXT NOT NULL,
           provider TEXT NOT NULL,
+          transport TEXT NOT NULL DEFAULT 'http_api',
           model_id TEXT NOT NULL,
           api_base_url TEXT NOT NULL,
           api_key_encrypted TEXT,
@@ -1479,6 +1810,13 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     )
     .execute(pool)
     .await?;
+
+    // Backward-compat migration: add transport column to existing databases.
+    let _ = sqlx::query(
+        "ALTER TABLE llm_profiles ADD COLUMN transport TEXT NOT NULL DEFAULT 'http_api'",
+    )
+    .execute(pool)
+    .await;
 
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_llm_profiles_provider ON llm_profiles(provider);")
         .execute(pool)
@@ -1546,6 +1884,11 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
+    // A3: add caller_phase to existing routing_policies rows
+    let _ = sqlx::query("ALTER TABLE routing_policies ADD COLUMN caller_phase TEXT")
+        .execute(pool)
+        .await;
+
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS route_decisions (
@@ -1585,6 +1928,23 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+/// Delete unpromoted memory candidates older than `days` days.
+/// Safe to call at any time; returns the number of rows deleted.
+pub async fn prune_old_memory_candidates(days: u32) -> anyhow::Result<u64> {
+    let pool = pool().await?;
+    let result = sqlx::query(
+        r#"
+        DELETE FROM memory_candidates
+        WHERE status != 'promoted'
+          AND created_at < datetime('now', ?1)
+        "#,
+    )
+    .bind(format!("-{days} days"))
+    .execute(&pool)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 async fn ensure_column(
@@ -1972,6 +2332,7 @@ mod tests {
             "agent_backends",
             "routing_policies",
             "route_decisions",
+            "goal_hints",
         ] {
             assert!(
                 tables.iter().any(|t| t == expected),
@@ -2787,6 +3148,7 @@ mod tests {
 
         for column in [
             "workspace_id",
+            "turn_id",
             "llm_tool_call_id",
             "risk_level",
             "proposal_id",
@@ -2813,6 +3175,20 @@ mod tests {
                     .await
                     .expect("check command_runs column"),
                 "expected command_runs.{column}"
+            );
+        }
+
+        for table in [
+            "chat_turns",
+            "chat_turn_events",
+            "chat_message_projections",
+            "memory_candidates",
+        ] {
+            assert!(
+                table_exists(&pool, table)
+                    .await
+                    .expect("check table exists"),
+                "expected table {table}"
             );
         }
     }

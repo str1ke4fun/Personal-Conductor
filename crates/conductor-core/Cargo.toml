@@ -1,6 +1,6 @@
 [package]
 name = "conductor-core"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 rust-version.workspace = true
 
@@ -10,6 +10,7 @@ tauri-events = ["tauri"]
 test-utils = ["tempfile"]
 
 [dependencies]
+model-router-core = { path = "../../crates/model-router-core" }
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true

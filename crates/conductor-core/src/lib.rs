@@ -19,6 +19,7 @@ pub mod events;
 pub mod expression;
 pub mod feishu;
 pub mod filewatch;
+pub mod goal_hints;
 pub mod goal_orchestrator;
 pub mod goal_tasks;
 pub mod goals;
@@ -31,6 +32,7 @@ pub mod llm_profiles;
 pub mod lock;
 pub mod mcp;
 pub mod memory;
+pub mod model_resolver;
 pub mod music;
 pub mod pacer;
 pub mod paths;
@@ -54,6 +56,7 @@ pub mod todo;
 pub mod tool_calls;
 pub mod tools;
 pub mod transcript;
+pub mod user_presence;
 pub mod workspaces;
 
 pub fn hello() -> &'static str {

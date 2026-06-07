@@ -15,6 +15,9 @@ const PINNED_CHITCHAT_TITLE: &str = "\u{95f2}\u{804a}";
 const ENABLE_PENDING_PILEUP_NUDGE: bool = false;
 
 pub fn spawn(app: AppHandle) {
+    // P0-4: Register AppHandle for agent_runs Tauri event emission
+    conductor_core::agent_runs::set_app_handle(app.clone());
+
     let pacer_app = app.clone();
     tauri::async_runtime::spawn(async move {
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -90,6 +93,7 @@ pub fn spawn(app: AppHandle) {
 
     // Mood decay timer — runs every 60 seconds
     tauri::async_runtime::spawn(async move {
+        let mut prune_ticks: u32 = 0;
         loop {
             tokio::time::sleep(Duration::from_secs(60)).await;
             if let Ok(mut mood) = expression::load_mood().await {
@@ -98,6 +102,17 @@ pub fn spawn(app: AppHandle) {
             }
             // Also apply affection daily decay
             let _ = conductor_core::affection::decrease_over_time().await;
+
+            // Prune unpromoted memory candidates older than 30 days (~once per day).
+            prune_ticks += 1;
+            if prune_ticks >= 24 * 60 {
+                prune_ticks = 0;
+                match conductor_core::db::prune_old_memory_candidates(30).await {
+                    Ok(n) if n > 0 => tracing::info!(rows = n, "pruned old memory candidates"),
+                    Err(err) => tracing::warn!(error = %err, "failed to prune memory candidates"),
+                    _ => {}
+                }
+            }
         }
     });
 
@@ -122,6 +137,7 @@ async fn emit_pet_expression(app: &AppHandle) {
                 "activity_variant": avatar.activity_variant.as_str(),
                 "mood_zone": zone.as_str(),
                 "relationship_stage": affection_state.stage.as_str(),
+                "affection_value": affection_state.value,
                 "pet_state": derive_pet_state(&avatar.activity_variant),
             }),
         );
@@ -271,62 +287,40 @@ fn build_goal_cycle_projection_payload(
         })
         .collect::<Vec<_>>();
 
+    // Each status renders as a single structured card (Completion/Blocked). We
+    // deliberately do NOT append a trailing free-text line like
+    // "Cycle #N 结果已写回会话。" — it duplicated the card and showed up as an
+    // awkward assistant prose bubble. The cycle marker now lives inside the
+    // card title so the timeline stays clean.
+    let cycle_tag = format!("Cycle #{}", cycle.cycle_no);
     let content_blocks = match goal.status.as_str() {
-        "awaiting_review" => vec![
-            conductor_core::chat::ContentBlock::Completion {
-                title: format!("Goal 本轮已生成可审阅结果：{}", goal.title),
-                summary: Some(summarize_goal_task_counts(tasks)),
-                steps,
-                duration_ms: None,
-            },
-            conductor_core::chat::ContentBlock::Text {
-                text: format!("Cycle #{} 结果已写回会话。", cycle.cycle_no),
-            },
-        ],
-        "accepted" => vec![
-            conductor_core::chat::ContentBlock::Completion {
-                title: format!("Goal 已完成：{}", goal.title),
-                summary: Some(summarize_goal_task_counts(tasks)),
-                steps,
-                duration_ms: None,
-            },
-            conductor_core::chat::ContentBlock::Text {
-                text: format!("Cycle #{} 已收口。", cycle.cycle_no),
-            },
-        ],
-        "rework_required" => vec![
-            conductor_core::chat::ContentBlock::Blocked {
-                title: format!("Goal 需要继续推进：{}", goal.title),
-                reason: summarize_goal_task_counts(tasks),
-                action_items: vec![],
-            },
-            conductor_core::chat::ContentBlock::Text {
-                text: format!("Cycle #{} 还需要继续推进。", cycle.cycle_no),
-            },
-        ],
-        "blocked" => vec![
-            conductor_core::chat::ContentBlock::Blocked {
-                title: format!("Goal 暂时阻塞：{}", goal.title),
-                reason: summarize_goal_task_counts(tasks),
-                action_items: vec![],
-            },
-            conductor_core::chat::ContentBlock::Text {
-                text: format!("Cycle #{} 暂时阻塞。", cycle.cycle_no),
-            },
-        ],
-        "failed" => vec![
-            conductor_core::chat::ContentBlock::Blocked {
-                title: format!("Goal 执行失败：{}", goal.title),
-                reason: summarize_goal_task_counts(tasks),
-                action_items: vec![],
-            },
-            conductor_core::chat::ContentBlock::Text {
-                text: format!(
-                    "Cycle #{} 以失败结束。最近一轮结果和错误已保留。",
-                    cycle.cycle_no
-                ),
-            },
-        ],
+        "awaiting_review" => vec![conductor_core::chat::ContentBlock::Completion {
+            title: format!("本轮结果可审阅 · {} · {}", cycle_tag, goal.title),
+            summary: Some(summarize_goal_task_counts(tasks)),
+            steps,
+            duration_ms: None,
+        }],
+        "accepted" => vec![conductor_core::chat::ContentBlock::Completion {
+            title: format!("Goal 已完成 · {} · {}", cycle_tag, goal.title),
+            summary: Some(summarize_goal_task_counts(tasks)),
+            steps,
+            duration_ms: None,
+        }],
+        "rework_required" => vec![conductor_core::chat::ContentBlock::Blocked {
+            title: format!("需要继续推进 · {} · {}", cycle_tag, goal.title),
+            reason: summarize_goal_task_counts(tasks),
+            action_items: vec![],
+        }],
+        "blocked" => vec![conductor_core::chat::ContentBlock::Blocked {
+            title: format!("暂时阻塞 · {} · {}", cycle_tag, goal.title),
+            reason: summarize_goal_task_counts(tasks),
+            action_items: vec![],
+        }],
+        "failed" => vec![conductor_core::chat::ContentBlock::Blocked {
+            title: format!("执行失败 · {} · {}", cycle_tag, goal.title),
+            reason: summarize_goal_task_counts(tasks),
+            action_items: vec![],
+        }],
         _ => vec![conductor_core::chat::ContentBlock::Text {
             text: format!("**Goal 进展 | {}**", goal.title),
         }],
@@ -479,6 +473,20 @@ fn spawn_sense_watchers(app: AppHandle) {
                     "kind": "proactive",
                     "content": content,
                     "action": "open_chat",
+                }),
+            );
+            // 5.8: emit pet_self_bubble so the pet window can show a proactive bubble
+            let bubble_content = content.clone();
+            tokio::spawn(async move {
+                conductor_core::initiative::emit_proactive_bubble(&bubble_content, "normal").await;
+            });
+            let _ = initiative_app.emit(
+                "pet_self_bubble",
+                json!({
+                    "id": format!("bubble-{}", now.timestamp_millis()),
+                    "content": content,
+                    "priority": "normal",
+                    "kind": "self",
                 }),
             );
         }
@@ -874,23 +882,38 @@ fn spawn_agent_runner() {
 
 /// Locate the `conductor` binary adjacent to the running desktop executable.
 fn locate_conductor_binary() -> String {
+    let bin_name = if cfg!(windows) {
+        "conductor.exe"
+    } else {
+        "conductor"
+    };
+
+    // 1. Explicit override (useful in CI or custom installs).
+    if let Ok(val) = std::env::var("CONDUCTOR_BIN") {
+        if !val.trim().is_empty() {
+            return val;
+        }
+    }
+
+    // 2. Same directory as the running desktop executable (release / packaged).
     if let Ok(exe) = std::env::current_exe() {
-        let candidate = exe.with_file_name(if cfg!(windows) {
-            "conductor.exe"
-        } else {
-            "conductor"
-        });
+        let candidate = exe.with_file_name(bin_name);
         if candidate.exists() {
             return candidate.to_string_lossy().into_owned();
         }
     }
-    // Fallback: assume it's on PATH.
-    if cfg!(windows) {
-        "conductor.exe"
-    } else {
-        "conductor"
+
+    // 3. Workspace target/debug — covers `tauri dev` / `cargo run` in development.
+    let workspace_debug = conductor_core::paths::root()
+        .join("target")
+        .join("debug")
+        .join(bin_name);
+    if workspace_debug.exists() {
+        return workspace_debug.to_string_lossy().into_owned();
     }
-    .to_string()
+
+    // 4. Fallback: assume it is on PATH.
+    bin_name.to_string()
 }
 
 /// Watch the exec-signals directory for tasks that need to be executed
@@ -925,7 +948,19 @@ fn spawn_exec_signal_watcher(app: AppHandle) {
 
                 let app = app.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = execute_goal_task_via_chat(&app, &task_id).await {
+                    // D-3: Branch by agent_kind — mcp_router tasks go through McpRouter executor
+                    let dispatch_result = async {
+                        let task = conductor_core::goal_tasks::get_task(&task_id)
+                            .await?
+                            .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
+                        if task.agent_kind == "mcp_router" {
+                            execute_goal_task_via_mcp_router(&task_id).await
+                        } else {
+                            execute_goal_task_via_chat(&app, &task_id).await
+                        }
+                    }
+                    .await;
+                    if let Err(e) = dispatch_result {
                         tracing::warn!(task_id = %task_id, error = ?e, "execute_goal_task_via_chat failed");
                         // Mark task as failed so goal can handle it.
                         let _ =
@@ -1219,48 +1254,6 @@ fn prepend_goal_task_blocked_projection(
     serde_json::to_string(&blocks).unwrap_or_else(|_| content.to_string())
 }
 
-fn goal_task_projection_placeholder_content(request_id: &str, task_title: &str) -> String {
-    serde_json::to_string(&vec![
-        conductor_core::chat::ContentBlock::RuntimeProjection {
-            request_id: request_id.to_string(),
-            label: goal_task_projection_title(task_title),
-        },
-    ])
-    .unwrap_or_else(|_| format!("Goal execution started for {}.", task_title))
-}
-
-async fn emit_goal_task_projection_started(
-    app: &AppHandle,
-    session_id: &str,
-    request_id: &str,
-    task_title: &str,
-) -> Option<String> {
-    let placeholder = conductor_core::chat::append_assistant_message_to_session(
-        session_id,
-        &goal_task_projection_placeholder_content(request_id, task_title),
-    )
-    .await
-    .ok();
-    if let Some(message) = placeholder.as_ref() {
-        emit_reply_stored(app, session_id, &message.id, Some(request_id)).await;
-    }
-    let _ = app.emit(
-        "thinking-update",
-        conductor_core::chat::ThinkingUpdateEvent {
-            session_id: Some(session_id.to_string()),
-            request_id: request_id.to_string(),
-            phase: "planning".to_string(),
-            message: format!(
-                "Background goal execution started for {}.",
-                goal_task_projection_title(task_title)
-            ),
-            turn: 0,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-        },
-    );
-    placeholder.map(|message| message.id)
-}
-
 /// Execute a goal task through conductor's built-in chat API.
 ///
 /// Runs in a DEDICATED session (not the user's chat session) to avoid
@@ -1268,13 +1261,32 @@ async fn emit_goal_task_projection_started(
 /// an assistant message in the linked goal session.
 async fn execute_goal_task_via_chat(app: &AppHandle, task_id: &str) -> anyhow::Result<()> {
     use conductor_core::{
-        chat::{ChatCapability, ChatTaskMode},
+        agent_teams,
+        chat::{ChatCapability, ChatExecutionContext, ChatTaskMode},
         goal_tasks,
     };
 
     let task = goal_tasks::get_task(task_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
+
+    // P0-1: Drive AgentTeamMember status via find_member_by_task_id.
+    // Transition to Running at execution start; Completed/Failed/Blocked at writeback.
+    let member_info = agent_teams::find_member_by_task_id(task_id)
+        .await
+        .ok()
+        .flatten();
+
+    if let Some((ref team_id, ref member)) = member_info {
+        if matches!(member.status, agent_teams::AgentMemberStatus::Idle) {
+            let _ = agent_teams::set_member_status(
+                team_id,
+                &member.agent_id,
+                agent_teams::AgentMemberStatus::Running,
+            )
+            .await;
+        }
+    }
     let goal_session_id = if let Some(goal_id) = &task.goal_id {
         conductor_core::chat::find_session_for_goal(goal_id).await
     } else {
@@ -1284,17 +1296,27 @@ async fn execute_goal_task_via_chat(app: &AppHandle, task_id: &str) -> anyhow::R
         "goal-task-{task_id}-{}",
         chrono::Utc::now().timestamp_millis()
     );
-    let mut projection_message_id: Option<String> = None;
 
-    if let Some(goal_session_id) = goal_session_id.as_deref() {
-        projection_message_id = emit_goal_task_projection_started(
-            app,
-            goal_session_id,
-            &projection_request_id,
-            &task.title,
-        )
-        .await;
-    }
+    // P0-D: emit execution started event
+    let _ = conductor_core::events::emit_goal_task_execution_started(
+        task_id,
+        task.goal_id.as_deref(),
+        task.cycle_id.as_deref(),
+        Some(&projection_request_id),
+    )
+    .await;
+
+    // Suppress per-task placeholder injection to prevent parallel tasks flooding the
+    // chat area. The final result is projected back as a single message on completion.
+    // In-progress visibility is provided by CycleSwimLane in the right panel.
+    let projection_message_id: Option<String> = None;
+
+    // P0-B: build typed goal/task context for ChatTurn anchors
+    let exec_context = ChatExecutionContext {
+        goal_id: task.goal_id.clone(),
+        goal_cycle_id: task.cycle_id.clone(),
+        agent_task_id: Some(task.id.clone()),
+    };
 
     // Create a throwaway session for this task execution.
     // We must NOT use the user's goal session — that would inject a user
@@ -1308,7 +1330,7 @@ async fn execute_goal_task_via_chat(app: &AppHandle, task_id: &str) -> anyhow::R
     .await?;
     conductor_core::chat::set_chat_session_kind(&exec_session.id, "goal", None).await?;
 
-    let reply_result = conductor_core::chat::send_message_v2_with_session_projection(
+    let reply_result = conductor_core::chat::send_message_v2_with_session_projection_ctx(
         execution_input,
         app,
         Some(exec_session.id.clone()),
@@ -1319,6 +1341,7 @@ async fn execute_goal_task_via_chat(app: &AppHandle, task_id: &str) -> anyhow::R
         Some(task.write_scope_json.clone()),
         Some(task.allowed_tools_json.clone()),
         Some(projection_request_id.clone()),
+        Some(exec_context),
     )
     .await;
 
@@ -1362,6 +1385,15 @@ async fn execute_goal_task_via_chat(app: &AppHandle, task_id: &str) -> anyhow::R
                     .await;
                 }
             }
+            // P0-1: Mark member as Failed on execution error.
+            if let Some((ref team_id, ref member)) = member_info {
+                let _ = agent_teams::set_member_status(
+                    team_id,
+                    &member.agent_id,
+                    agent_teams::AgentMemberStatus::Failed,
+                )
+                .await;
+            }
             return Err(err);
         }
     };
@@ -1375,8 +1407,8 @@ async fn execute_goal_task_via_chat(app: &AppHandle, task_id: &str) -> anyhow::R
     })
     .await
     .unwrap_or_default();
+    let writeback_state = derive_goal_task_writeback_state(&reply.message, &tool_calls);
     let writeback_result: anyhow::Result<()> = async {
-        let writeback_state = derive_goal_task_writeback_state(&reply.message, &tool_calls);
         let result_ref = format!("chat:{}", reply.message.id);
         let projected_content = match &writeback_state {
             GoalTaskWritebackState::ReviewReady => {
@@ -1421,7 +1453,44 @@ async fn execute_goal_task_via_chat(app: &AppHandle, task_id: &str) -> anyhow::R
     }
     .await;
 
+    // P0-D: emit success event when writeback succeeded
+    if writeback_result.is_ok() {
+        let result_ref = format!("chat:{}", reply.message.id);
+        let _ = conductor_core::events::emit_goal_task_result_projected(
+            task_id,
+            &result_ref,
+            None,
+            Some(&projection_request_id),
+        )
+        .await;
+
+        // P0-1: Mark member as Completed on successful writeback.
+        if let Some((ref team_id, ref member)) = member_info {
+            let new_status = match &writeback_state {
+                GoalTaskWritebackState::ReviewReady => agent_teams::AgentMemberStatus::Completed,
+                GoalTaskWritebackState::Blocked(_) => agent_teams::AgentMemberStatus::Blocked,
+            };
+            let _ = agent_teams::set_member_status(team_id, &member.agent_id, new_status).await;
+        }
+    }
+
     if let Err(err) = writeback_result {
+        let _ = conductor_core::events::emit_goal_task_writeback_failed(
+            task_id,
+            &format!("{err:#}"),
+            Some(&projection_request_id),
+        )
+        .await;
+
+        // P0-1: Mark member as Failed on writeback failure.
+        if let Some((ref team_id, ref member)) = member_info {
+            let _ = agent_teams::set_member_status(
+                team_id,
+                &member.agent_id,
+                agent_teams::AgentMemberStatus::Failed,
+            )
+            .await;
+        }
         if let Some(goal_session_id) = goal_session_id.as_deref() {
             let failure_projection = goal_task_status_projection_ascii(
                 &task.title,
@@ -1457,6 +1526,72 @@ async fn execute_goal_task_via_chat(app: &AppHandle, task_id: &str) -> anyhow::R
     let _ = app.emit("agent_runs_changed", ());
     let _ = app.emit("agent_teams_changed", ());
     let _ = app.emit("goals_changed", ());
+
+    Ok(())
+}
+
+// D-3: McpRouter executor — routes PlannedTask(agent_kind=mcp_router) via the
+// model-router-mcp server instead of the chat LLM loop.
+async fn execute_goal_task_via_mcp_router(task_id: &str) -> anyhow::Result<()> {
+    use conductor_core::goal_tasks;
+    use tokio::io::AsyncWriteExt;
+
+    let task = goal_tasks::get_task(task_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("mcp_router task not found: {task_id}"))?;
+
+    // S6: Only claim if not already claimed/running — exec signal may fire on any status.
+    match task.status.as_str() {
+        "proposed" | "queued" => {
+            goal_tasks::claim_task(task_id, "mcp-router-executor", 600).await?;
+            goal_tasks::start_task(task_id).await?;
+        }
+        "claimed" => {
+            goal_tasks::start_task(task_id).await?;
+        }
+        "running" => {}
+        other => {
+            return Err(anyhow::anyhow!(
+                "mcp_router task {task_id} in unexpected status: {other}"
+            ));
+        }
+    }
+
+    let work_kind = conductor_core::routing::classify_task(&task.title, &task.instruction)
+        .as_str()
+        .to_string();
+
+    let mcp_binary =
+        std::env::var("MODEL_ROUTER_MCP_BIN").unwrap_or_else(|_| "model-router-mcp".to_string());
+
+    let route_request = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"model.route\",\"arguments\":{{\"work_kind\":\"{work_kind}\"}}}}}}\n"
+    );
+
+    // Try to spawn the MCP binary and send one request; ignore errors gracefully.
+    let routed = async {
+        let mut child = tokio::process::Command::new(&mcp_binary)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(route_request.as_bytes()).await;
+            drop(stdin);
+        }
+        let out = child.wait_with_output().await?;
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        anyhow::Ok(text)
+    }
+    .await
+    .unwrap_or_else(|_| "unavailable".to_string());
+
+    let result_ref = format!(
+        "mcp_router:{work_kind}:{}",
+        routed.trim().chars().take(80).collect::<String>()
+    );
+    goal_tasks::set_task_result_ref_review_ready(task_id, &result_ref).await?;
 
     Ok(())
 }

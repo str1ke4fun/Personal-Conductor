@@ -5,6 +5,59 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
 
+// ── TransportKind ─────────────────────────────────────────────────────────────
+
+/// How the model is invoked — HTTP API, CLI subprocess, or MCP server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportKind {
+    /// Standard HTTP/HTTPS REST API (OpenAI-compatible or Anthropic API).
+    HttpApi,
+    /// Claude CLI subprocess (`claude -p`).
+    ClaudeCli,
+    /// Codex CLI subprocess.
+    CodexCli,
+    /// MCP server (model-router-mcp or any MCP tool server).
+    McpServer,
+}
+
+impl TransportKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::HttpApi => "http_api",
+            Self::ClaudeCli => "claude_cli",
+            Self::CodexCli => "codex_cli",
+            Self::McpServer => "mcp_server",
+        }
+    }
+
+    /// Infer transport from legacy `provider` string for backward compatibility.
+    pub fn from_provider(provider: &str) -> Self {
+        match provider {
+            "claude_cli" => Self::ClaudeCli,
+            "codex_cli" => Self::CodexCli,
+            "mcp_router" | "mcp_server" => Self::McpServer,
+            _ => Self::HttpApi, // openai / anthropic / local → HTTP API
+        }
+    }
+
+    /// Parse from the stored TEXT value.
+    fn from_str_or_default(s: &str) -> Self {
+        match s {
+            "claude_cli" => Self::ClaudeCli,
+            "codex_cli" => Self::CodexCli,
+            "mcp_server" => Self::McpServer,
+            _ => Self::HttpApi,
+        }
+    }
+}
+
+impl Default for TransportKind {
+    fn default() -> Self {
+        Self::HttpApi
+    }
+}
+
 // ── LlmProfile ────────────────────────────────────────────────────────────────
 
 /// Represents a configured LLM provider profile (model + endpoint + credentials).
@@ -13,6 +66,8 @@ pub struct LlmProfile {
     pub id: String,
     pub name: String,
     pub provider: String,
+    /// How the model is invoked (HTTP API, CLI subprocess, MCP server).
+    pub transport: TransportKind,
     pub model_id: String,
     pub api_base_url: String,
     pub api_key_encrypted: Option<String>,
@@ -26,6 +81,10 @@ pub struct LlmProfile {
 // ── CRUD ──────────────────────────────────────────────────────────────────────
 
 /// Create a new LlmProfile. Returns the inserted record.
+///
+/// `transport` is inferred from `provider` when not supplied:
+/// `claude_cli` → `ClaudeCli`, `codex_cli` → `CodexCli`,
+/// `mcp_router`/`mcp_server` → `McpServer`, everything else → `HttpApi`.
 pub async fn create_profile(
     name: &str,
     provider: &str,
@@ -35,24 +94,36 @@ pub async fn create_profile(
     max_tokens: i64,
     temperature: f64,
 ) -> anyhow::Result<LlmProfile> {
-    let valid_providers = ["openai", "anthropic", "local"];
+    let valid_providers = [
+        "openai",
+        "anthropic",
+        "local",
+        "claude_cli",
+        "codex_cli",
+        "mcp_router",
+    ];
     if !valid_providers.contains(&provider) {
-        bail!("invalid provider: {provider}. must be one of: openai, anthropic, local");
+        bail!(
+            "invalid provider: {provider}. must be one of: {}",
+            valid_providers.join(", ")
+        );
     }
 
+    let transport = TransportKind::from_provider(provider);
     let now = Utc::now();
     let id = format!("llmprof-{}", Uuid::new_v4());
     let pool = db::pool().await?;
 
     sqlx::query(
         r#"INSERT INTO llm_profiles
-          (id, name, provider, model_id, api_base_url, api_key_encrypted,
+          (id, name, provider, transport, model_id, api_base_url, api_key_encrypted,
            max_tokens, temperature, enabled, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)"#,
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)"#,
     )
     .bind(&id)
     .bind(name)
     .bind(provider)
+    .bind(transport.as_str())
     .bind(model_id)
     .bind(api_base_url)
     .bind(api_key_encrypted)
@@ -68,6 +139,7 @@ pub async fn create_profile(
         id,
         name: name.to_string(),
         provider: provider.to_string(),
+        transport,
         model_id: model_id.to_string(),
         api_base_url: api_base_url.to_string(),
         api_key_encrypted: api_key_encrypted.map(String::from),
@@ -83,7 +155,7 @@ pub async fn create_profile(
 pub async fn get_profile(profile_id: &str) -> anyhow::Result<Option<LlmProfile>> {
     let pool = db::pool().await?;
     let row = sqlx::query(
-        r#"SELECT id, name, provider, model_id, api_base_url, api_key_encrypted,
+        r#"SELECT id, name, provider, transport, model_id, api_base_url, api_key_encrypted,
                   max_tokens, temperature, enabled, created_at, updated_at
            FROM llm_profiles WHERE id = ?"#,
     )
@@ -104,7 +176,7 @@ pub async fn list_profiles(enabled_only: bool) -> anyhow::Result<Vec<LlmProfile>
 
     let rows = if enabled_only {
         sqlx::query(
-            r#"SELECT id, name, provider, model_id, api_base_url, api_key_encrypted,
+            r#"SELECT id, name, provider, transport, model_id, api_base_url, api_key_encrypted,
                       max_tokens, temperature, enabled, created_at, updated_at
                FROM llm_profiles WHERE enabled = 1
                ORDER BY created_at DESC"#,
@@ -113,7 +185,7 @@ pub async fn list_profiles(enabled_only: bool) -> anyhow::Result<Vec<LlmProfile>
         .await?
     } else {
         sqlx::query(
-            r#"SELECT id, name, provider, model_id, api_base_url, api_key_encrypted,
+            r#"SELECT id, name, provider, transport, model_id, api_base_url, api_key_encrypted,
                       max_tokens, temperature, enabled, created_at, updated_at
                FROM llm_profiles
                ORDER BY created_at DESC"#,
@@ -142,9 +214,19 @@ pub async fn update_profile(
         .ok_or_else(|| anyhow::anyhow!("llm_profile not found: {profile_id}"))?;
 
     if let Some(p) = provider {
-        let valid_providers = ["openai", "anthropic", "local"];
+        let valid_providers = [
+            "openai",
+            "anthropic",
+            "local",
+            "claude_cli",
+            "codex_cli",
+            "mcp_router",
+        ];
         if !valid_providers.contains(&p) {
-            bail!("invalid provider: {p}. must be one of: openai, anthropic, local");
+            bail!(
+                "invalid provider: {p}. must be one of: {}",
+                valid_providers.join(", ")
+            );
         }
     }
 
@@ -184,6 +266,8 @@ pub async fn update_profile(
     }
     if let Some(v) = provider {
         profile.provider = v.to_string();
+        // Re-derive transport whenever provider changes.
+        profile.transport = TransportKind::from_provider(v);
     }
     if let Some(v) = model_id {
         profile.model_id = v.to_string();
@@ -230,11 +314,16 @@ fn row_to_profile(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<LlmProfile> {
     let created_at = parse_utc(&row.try_get::<String, _>("created_at")?)?;
     let updated_at = parse_utc(&row.try_get::<String, _>("updated_at")?)?;
     let enabled_raw: i64 = row.try_get("enabled")?;
+    let transport = row
+        .try_get::<String, _>("transport")
+        .map(|s| TransportKind::from_str_or_default(&s))
+        .unwrap_or_default();
 
     Ok(LlmProfile {
         id: row.try_get("id")?,
         name: row.try_get("name")?,
         provider: row.try_get("provider")?,
+        transport,
         model_id: row.try_get("model_id")?,
         api_base_url: row.try_get("api_base_url")?,
         api_key_encrypted: row.try_get("api_key_encrypted")?,

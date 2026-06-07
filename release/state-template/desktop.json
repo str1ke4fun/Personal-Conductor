@@ -1,0 +1,10 @@
+{
+    "pet":  {
+                "x":  null,
+                "y":  null,
+                "width":  320,
+                "height":  420,
+                "scale":  1,
+                "locked":  false
+            }
+}

@@ -1,0 +1,48 @@
+/* ── Unified design tokens for 清和 × Trae IDE ── */
+:root {
+  /* Bottom/layer colors */
+  --bg-base: #0E0F12;
+  --bg-surface: #15171C;
+  --bg-elevated: #1B1E25;
+  --border-hair: #22252B;
+  --text-primary: #E8E6E0;
+  --text-secondary: #7A7C82;
+
+  /* State colors (shared across Layer 1/2/3) */
+  --state-running: #C8FF6B;
+  --state-done: #5EEAD4;
+  --state-error: #FB7185;
+  --state-warn: #FFB454;
+  --state-quiet: #6E7681;
+
+  /* Pet-specific tokens */
+  --pet-glow-happy: 0 0 18px rgba(250,204,21,.55);
+  --pet-glow-shy: 0 0 12px rgba(244,114,182,.45);
+  --pet-glow-aff: 0 0 14px rgba(236,72,153,.45);
+  --pet-brightness-quiet: 0.88;
+  --pet-saturation-sad: 0.8;
+
+  /* Scene tints */
+  --scene-tint-morning: linear-gradient(180deg, rgba(254,240,138,.18), transparent 60%);
+  --scene-tint-afternoon: linear-gradient(180deg, rgba(186,230,253,.12), transparent 60%);
+  --scene-tint-evening: linear-gradient(180deg, rgba(251,146,60,.18), transparent 55%);
+  --scene-tint-night: linear-gradient(180deg, rgba(30,27,75,.55), transparent 60%);
+  --scene-tint-music: linear-gradient(180deg, rgba(216,180,254,.14), transparent 60%);
+  --scene-tint-work: linear-gradient(180deg, rgba(148,163,184,.10), transparent 60%);
+  --scene-tint-relax: linear-gradient(180deg, rgba(216,180,254,.14), transparent 60%);
+
+  /* Typography */
+  --font-display: 'Fraunces', Georgia, serif;
+  --font-ui: 'Bricolage Grotesque', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Courier New', monospace;
+}
+
+:root[data-theme="light"] {
+  --bg-base: #F4F1EC;
+  --bg-surface: #FFFFFF;
+  --bg-elevated: #FFFFFF;
+  --border-hair: #E5E2DB;
+  --text-primary: #1A1A1A;
+  --text-secondary: #6B6E72;
+  --state-running: #4F46E5;
+}

@@ -157,7 +157,8 @@ pub fn execute_tool_with_workspace(
         get_tool(tool_id).ok_or_else(|| anyhow::anyhow!("tool not found: {}", tool_id))?;
 
     validate_input(&spec, input)?;
-    validate_workspace_context(&spec, workspace_id)?;
+    let effective_spec = effective_spec_for_input(&spec, input)?;
+    validate_workspace_context(&effective_spec, workspace_id)?;
     let workspace_root = workspace_id
         .map(|id| {
             shared_runtime()
@@ -166,7 +167,7 @@ pub fn execute_tool_with_workspace(
         })
         .transpose()?;
     let _guard = WorkspaceRootGuard::push(workspace_root);
-    run_tool_executor(&spec, executor, input)
+    run_tool_executor(&effective_spec, executor, input)
 }
 
 pub async fn execute_tool_with_workspace_async(
@@ -178,13 +179,14 @@ pub async fn execute_tool_with_workspace_async(
         get_tool(tool_id).ok_or_else(|| anyhow::anyhow!("tool not found: {}", tool_id))?;
 
     validate_input(&spec, input)?;
-    validate_workspace_context_async(&spec, workspace_id).await?;
+    let effective_spec = effective_spec_for_input(&spec, input)?;
+    validate_workspace_context_async(&effective_spec, workspace_id).await?;
     let workspace_root = match workspace_id {
         Some(id) => Some(crate::workspaces::get(id).await?.root),
         None => None,
     };
 
-    let spec_for_worker = spec.clone();
+    let spec_for_worker = effective_spec.clone();
     let input_for_worker = input.clone();
     tokio::task::spawn_blocking(move || {
         let _guard = WorkspaceRootGuard::push(workspace_root);
@@ -237,6 +239,31 @@ pub(crate) fn validate_input(
     }
 
     Ok(())
+}
+
+pub(crate) fn effective_spec_for_input(
+    spec: &ToolSpec,
+    input: &serde_json::Value,
+) -> Result<ToolSpec, anyhow::Error> {
+    if spec.id != "bash.execute" {
+        return Ok(spec.clone());
+    }
+
+    let mut effective = spec.clone();
+    let Some(command) = input.get("command").and_then(|value| value.as_str()) else {
+        return Ok(effective);
+    };
+
+    effective.risk_level = crate::shell::security::classify_command_risk(command)?;
+    if effective.risk_level == RiskLevel::ReadOnly {
+        effective.permissions = vec![ToolPermission::ReadWorkspace];
+    } else if effective.risk_level == RiskLevel::WorkspaceWrite {
+        effective.permissions = vec![
+            ToolPermission::ReadWorkspace,
+            ToolPermission::WriteWorkspace,
+        ];
+    }
+    Ok(effective)
 }
 
 fn validate_workspace_context(
@@ -319,5 +346,61 @@ fn validate_trust_level(
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bash_spec() -> ToolSpec {
+        ToolSpec {
+            id: "bash.execute".to_string(),
+            name: "execute".to_string(),
+            description: "execute shell command".to_string(),
+            provider: ToolProviderKind::Internal,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["command"],
+                "properties": {
+                    "command": { "type": "string" }
+                }
+            }),
+            output_schema: serde_json::json!({}),
+            risk_level: RiskLevel::ExternalSideEffect,
+            permissions: vec![ToolPermission::SystemControl],
+            supports_dry_run: false,
+            workspace_required: false,
+        }
+    }
+
+    #[test]
+    fn bash_execute_read_only_command_lowers_effective_risk() {
+        let effective = effective_spec_for_input(
+            &bash_spec(),
+            &serde_json::json!({ "command": "findstr /s /n TODO src\\*.rs" }),
+        )
+        .expect("effective spec");
+
+        assert_eq!(effective.risk_level, RiskLevel::ReadOnly);
+        assert_eq!(effective.permissions, vec![ToolPermission::ReadWorkspace]);
+    }
+
+    #[test]
+    fn bash_execute_write_command_keeps_write_risk() {
+        let effective = effective_spec_for_input(
+            &bash_spec(),
+            &serde_json::json!({ "command": "mkdir tmp-output" }),
+        )
+        .expect("effective spec");
+
+        assert_eq!(effective.risk_level, RiskLevel::WorkspaceWrite);
+        assert_eq!(
+            effective.permissions,
+            vec![
+                ToolPermission::ReadWorkspace,
+                ToolPermission::WriteWorkspace
+            ]
+        );
     }
 }

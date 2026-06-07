@@ -20,6 +20,7 @@ target-*/
 
 # Release artifacts
 release/_build/
+release/artifacts/
 release/app/
 release/bin/
 release/docs/
@@ -27,6 +28,8 @@ release/resources/
 release/state/
 release/state-template/conductor.sqlite
 release/state-template/conductor.sqlite-*
+apps/desktop/src-tauri/resources/state-template/*
+!apps/desktop/src-tauri/resources/state-template/.gitkeep
 Personal-Conductor-*.zip
 /*.zip
 
@@ -46,6 +49,8 @@ live2d-automation-master/
 /tools/
 agent_proxy_traffic.db
 /codex-*.exe
+wiki/
+skills/*.zip
 
 # Model caches and local test files
 **/.fastembed_cache/

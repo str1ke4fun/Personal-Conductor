@@ -26,6 +26,7 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
   'file.grep': '搜索内容',
   'file.read': '读取文件',
   'file.write': '写入文件',
+  'file.append': '追加文件',
   'file.edit': '编辑文件',
   'file.stat': '文件信息',
   'workspace.current': '查看工作区',
@@ -242,13 +243,6 @@ export function ToolUseCard({
               </button>
             )}
           </div>
-        </div>
-      )}
-
-      {/* Retry hint for retryable status */}
-      {status === 'retryable' && (
-        <div className="tool-retry-hint">
-          <span>操作失败，可以重试</span>
         </div>
       )}
 

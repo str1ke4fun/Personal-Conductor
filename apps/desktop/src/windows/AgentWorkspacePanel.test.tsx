@@ -92,6 +92,10 @@ vi.mock('./GoalConsole', () => ({
   default: () => <div data-testid="goal-console">goals</div>,
 }));
 
+vi.mock('./CycleIndicator', () => ({
+  CycleIndicator: () => null,
+}));
+
 vi.mock('./ChatTimelinePane', () => ({
   ChatTimelinePane: ({
     onApprovePlan,
@@ -158,6 +162,7 @@ vi.mock('../ipc/invoke', () => ({
   resumeGoal: mocks.resumeGoalMock,
   approveGoalPlan: mocks.approveGoalPlanMock,
   appendGoalUserMessage: mocks.appendGoalUserMessageMock,
+  getGoalGraph: vi.fn().mockResolvedValue(null),
 }));
 
 import { AgentWorkspacePanel } from './AgentWorkspacePanel';

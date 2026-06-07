@@ -58,36 +58,23 @@ export function AffectionBadge() {
       .catch(() => {});
   }, []);
 
-  // Listen for expression events
+  // Listen for expression events — value and stage both come from here now.
   useEffect(() => {
     const unlisten = listen<PetExpressionPayload>('pet_expression', (event) => {
       const newStage = event.payload.relationship_stage;
-      if (newStage) {
-        setStage(newStage);
+      const newValue = event.payload.affection_value;
+      if (newStage) setStage(newStage);
+      if (typeof newValue === 'number' && newValue !== prevValueRef.current) {
+        setAnimating(true);
+        setValue(newValue);
+        setStage(getStage(newValue));
+        prevValueRef.current = newValue;
+        setTimeout(() => setAnimating(false), 600);
       }
     });
     return () => {
       unlisten.then((d) => d()).catch(() => {});
     };
-  }, []);
-
-  // Periodic refresh for affection value
-  useEffect(() => {
-    const interval = setInterval(() => {
-      api
-        .getAffection()
-        .then((v) => {
-          if (v !== prevValueRef.current) {
-            setAnimating(true);
-            setValue(v);
-            setStage(getStage(v));
-            prevValueRef.current = v;
-            setTimeout(() => setAnimating(false), 600);
-          }
-        })
-        .catch(() => {});
-    }, 30_000);
-    return () => clearInterval(interval);
   }, []);
 
   const label = STAGE_LABELS[stage];

@@ -318,6 +318,25 @@ lazy_static::lazy_static! {
     static ref INITIATIVE_ENGINE: RwLock<InitiativeEngine> = RwLock::new(InitiativeEngine::new());
 }
 
+/// Emit a proactive bubble event for the pet window. (5.8)
+///
+/// Should be called from the initiative decision handler whenever an initiative
+/// fires and a message has been generated for the user.
+pub async fn emit_proactive_bubble(content: &str, priority: &str) {
+    crate::events::append(
+        "initiative",
+        "pet_self_bubble",
+        &serde_json::json!({
+            "id": format!("bubble-{}", uuid::Uuid::new_v4()),
+            "content": content,
+            "priority": priority,
+            "kind": "self",
+        }),
+    )
+    .await
+    .ok();
+}
+
 pub fn update_initiative_context(updates: PartialContext) {
     let engine = INITIATIVE_ENGINE.read().unwrap();
     engine.update_context(updates);

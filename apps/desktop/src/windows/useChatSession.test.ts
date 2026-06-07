@@ -14,7 +14,8 @@ vi.mock('@tauri-apps/api/window', () => ({
 vi.mock('../ipc/invoke', () => ({
   api: {
     listChatMessages: vi.fn(() => Promise.resolve([])),
-    getChatSessionMessages: vi.fn(() => Promise.resolve([])),
+    getChatMessageProjections: vi.fn(() => Promise.resolve([])),
+    getChatSessionMessagesV2: vi.fn(() => Promise.resolve([])),
     sendChatMessageV2: vi.fn(() =>
       Promise.resolve({
         message: { id: 'msg-1', content: 'reply', role: 'assistant' },

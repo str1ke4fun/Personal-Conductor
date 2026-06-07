@@ -34,13 +34,14 @@ fn execute_tool_search(
     _spec: &ToolSpec,
     input: &serde_json::Value,
 ) -> Result<ToolExecutionResult, anyhow::Error> {
-    let query = input
+    let raw_query = input
         .get("query")
         .or_else(|| input.get("q"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
-        .trim()
-        .to_lowercase();
+        .trim();
+    let query = normalize_search_text(raw_query);
+    let query_terms = search_terms(&query);
     let limit = input
         .get("limit")
         .and_then(|v| v.as_u64())
@@ -49,22 +50,14 @@ fn execute_tool_search(
 
     let mut matches = list_tools()
         .into_iter()
-        .filter(|tool| {
-            if query.is_empty() {
-                return true;
+        .filter_map(|tool| {
+            let score = tool_search_score(&tool, &query, &query_terms);
+            if score == 0 {
+                return None;
             }
-            let haystack = format!(
-                "{} {} {} {} {}",
-                tool.id,
-                tool.name,
-                tool.description,
-                tool.provider.as_str(),
-                tool.risk_level.as_str()
-            )
-            .to_lowercase();
-            haystack.contains(&query)
+            Some((score, tool))
         })
-        .map(|tool| {
+        .map(|(score, tool)| {
             serde_json::json!({
                 "id": tool.id,
                 "name": tool.name,
@@ -73,10 +66,19 @@ fn execute_tool_search(
                 "risk_level": tool.risk_level.as_str(),
                 "supports_dry_run": tool.supports_dry_run,
                 "workspace_required": tool.workspace_required,
+                "score": score,
             })
         })
         .collect::<Vec<_>>();
     matches.sort_by(|a, b| {
+        let score_cmp = b
+            .get("score")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            .cmp(&a.get("score").and_then(|v| v.as_i64()).unwrap_or(0));
+        if score_cmp != std::cmp::Ordering::Equal {
+            return score_cmp;
+        }
         a.get("id")
             .and_then(|v| v.as_str())
             .unwrap_or("")
@@ -90,6 +92,102 @@ fn execute_tool_search(
         error: None,
         duration_ms: 0,
     })
+}
+
+fn normalize_search_text(value: &str) -> String {
+    value
+        .to_lowercase()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ('\u{4e00}'..='\u{9fff}').contains(&ch) {
+                ch
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn search_terms(normalized_query: &str) -> Vec<&str> {
+    normalized_query
+        .split_whitespace()
+        .filter(|term| term.chars().count() >= 2)
+        .collect()
+}
+
+fn tool_search_aliases(tool_id: &str) -> &'static str {
+    match tool_id {
+        "file.glob" => {
+            "file glob list files list directory list dir browse workspace ls tree find paths"
+        }
+        "file.grep" => "file grep search files search content find text ripgrep rg",
+        "file.read" => "file read read file open file cat inspect file view file content",
+        "file.write" => "file write write file create file save file output report",
+        "file.append" => "file append append file chunked write long report add content",
+        "file.edit" => "file edit edit file patch file modify file replace text",
+        "file.stat" => "file stat file info file metadata exists size modified",
+        "agent.start" => {
+            "agent start start agent background agent subagent claude run delegate async status"
+        }
+        "agent.read_output" => {
+            "agent read output read agent output agent logs agent status running result"
+        }
+        "agent.stop" => "agent stop stop agent cancel agent terminate",
+        "subagent.claude_p" => {
+            "subagent claude claude p claude_p delegate child agent background agent"
+        }
+        "tool.search" => "tool search find tools discover tools catalog capabilities",
+        "workspace.current" => "workspace current workspace root cwd working directory",
+        _ => "",
+    }
+}
+
+fn tool_search_score(tool: &ToolSpec, query: &str, query_terms: &[&str]) -> i64 {
+    if query.is_empty() {
+        return 1;
+    }
+
+    let haystack = normalize_search_text(&format!(
+        "{} {} {} {} {} {}",
+        tool.id,
+        tool.name,
+        tool.description,
+        tool.provider.as_str(),
+        tool.risk_level.as_str(),
+        tool_search_aliases(&tool.id)
+    ));
+    if haystack.is_empty() {
+        return 0;
+    }
+
+    let compact_query = query.replace(' ', "");
+    let compact_haystack = haystack.replace(' ', "");
+    let mut score = 0;
+    if haystack.contains(query) {
+        score += 100;
+    }
+    if !compact_query.is_empty() && compact_haystack.contains(&compact_query) {
+        score += 80;
+    }
+
+    let mut matched_terms = 0;
+    for term in query_terms {
+        if haystack.split_whitespace().any(|part| part == *term) || haystack.contains(term) {
+            matched_terms += 1;
+        }
+    }
+    if matched_terms == 0 {
+        return score;
+    }
+
+    score += matched_terms as i64 * 10;
+    if matched_terms == query_terms.len() {
+        score += 40;
+    }
+    score
 }
 
 fn execute_todo_write(
@@ -386,7 +484,8 @@ pub(super) fn register(registry: &mut ToolRegistry) {
                                 "provider": { "type": "string" },
                                 "risk_level": { "type": "string" },
                                 "supports_dry_run": { "type": "boolean" },
-                                "workspace_required": { "type": "boolean" }
+                                "workspace_required": { "type": "boolean" },
+                                "score": { "type": "integer" }
                             }
                         }
                     }

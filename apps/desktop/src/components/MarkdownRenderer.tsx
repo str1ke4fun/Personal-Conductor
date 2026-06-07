@@ -1,7 +1,9 @@
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
-import 'highlight.js/styles/github.css';
+// Syntax-highlight token colors are defined in app.css (.hljs-* rules) so they
+// stay theme-aware. We deliberately do NOT import a highlight.js theme here —
+// those ship an opaque background that clashes with the chat panel surface.
 
 interface MarkdownRendererProps {
   content: string;

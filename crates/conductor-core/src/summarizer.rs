@@ -154,16 +154,38 @@ async fn generate_llm_summary(
     let system_prompt = build_system_prompt(user_lang);
     let user_prompt = build_user_prompt(input);
 
-    let llm_req_config = llm::LlmRequestConfig::from_config(config);
-    let model = if config.model.is_empty() {
-        "gpt-4o-mini"
-    } else {
-        &config.model
-    };
+    let resolved = crate::model_resolver::ModelResolver::resolve(
+        crate::model_resolver::CallerContext::Summarizer,
+        None,
+    )
+    .await
+    .unwrap_or_else(|_| crate::model_resolver::ResolvedModel {
+        model_id: if config.model.is_empty() {
+            "gpt-4o-mini".to_string()
+        } else {
+            config.model.clone()
+        },
+        transport: crate::llm_profiles::TransportKind::HttpApi,
+        profile_id: None,
+        policy_id: None,
+        fallback_used: true,
+        backend_kind: crate::agent_backends::BackendKind::ClaudeP,
+        provider: None,
+        api_base_url: None,
+        api_key: None,
+        temperature: None,
+        max_tokens: None,
+    });
+    let llm_req_config = llm::LlmRequestConfig::from_resolved_with_fallback(&resolved, config);
 
-    let response = llm::call(model, &system_prompt, &user_prompt, &llm_req_config)
-        .await
-        .context("LLM call failed")?;
+    let response = llm::call(
+        &resolved.model_id,
+        &system_prompt,
+        &user_prompt,
+        &llm_req_config,
+    )
+    .await
+    .context("LLM call failed")?;
 
     Ok(format!("# {} - {}\n\n{}", slug, iso, response.trim()))
 }

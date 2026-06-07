@@ -5,6 +5,7 @@ import {
   api,
   appendGoalUserMessage,
   ChatMessage,
+  ChatMessageProjection,
   CommandRun,
   GoalSeed,
   parseContentBlocks,
@@ -170,6 +171,43 @@ function mergeHistory(
   }
 
   return sortMessages(merged);
+}
+
+function normalizeProjection(p: ChatMessageProjection): ChatMessage {
+  return {
+    id: p.id,
+    role: p.role as ChatMessage['role'],
+    content: Array.isArray(p.content_blocks_json)
+      ? JSON.stringify(p.content_blocks_json)
+      : typeof p.content_blocks_json === 'string'
+        ? p.content_blocks_json
+        : JSON.stringify(p.content_blocks_json),
+    created_at: p.created_at,
+    seq: typeof p.seq === 'number' ? p.seq : Number(p.seq),
+  };
+}
+
+async function loadSessionMessages(sessionId: string): Promise<ChatMessage[]> {
+  const projections = await api.getChatMessageProjections(sessionId);
+  const visible = projections.filter((p) => p.visibility === 'visible');
+  if (visible.length > 0) {
+    return visible.map(normalizeProjection);
+  }
+  // Fallback for sessions created before the projection layer was introduced.
+  const legacy = await api.getChatSessionMessagesV2(sessionId);
+  return (legacy as any[]).map((m) => {
+    const seq = m.seq != null ? Number(m.seq) : undefined;
+    if (Array.isArray(m.content_blocks)) {
+      return {
+        id: m.id,
+        role: m.role,
+        content: JSON.stringify(m.content_blocks),
+        created_at: m.created_at,
+        seq,
+      } as ChatMessage;
+    }
+    return { ...m, seq } as ChatMessage;
+  });
 }
 
 function sortMessages(messages: DisplayMessage[]): DisplayMessage[] {
@@ -377,7 +415,7 @@ export function useChatSession(opts?: {
       updateSessionState(key, (state) => ({ ...state, loadError: null }));
       try {
         const items = activeSessionId
-          ? await api.getChatSessionMessages(activeSessionId)
+          ? await loadSessionMessages(activeSessionId)
           : await api.listChatMessages();
         if (cancelled) return;
         updateSessionState(key, (state) => ({
@@ -410,7 +448,7 @@ export function useChatSession(opts?: {
     const unlisten = listen('goals_changed', async () => {
       if (currentState.sending || projectedRunCount > 0) return;
       try {
-        const items = await api.getChatSessionMessages(sid);
+        const items = await loadSessionMessages(sid);
         updateSessionState(sid, (state) => ({
           ...state,
           messages: mergeHistory(state.messages, items),
@@ -430,7 +468,7 @@ export function useChatSession(opts?: {
       if ((event.payload.session_id ?? null) !== sid) return;
       try {
         const items = sid
-          ? await api.getChatSessionMessages(sid)
+          ? await loadSessionMessages(sid)
           : await api.listChatMessages();
         updateSessionState(key, (state) => ({
           ...(state.activeRequestId === event.payload.request_id

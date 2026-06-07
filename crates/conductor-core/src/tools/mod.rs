@@ -131,6 +131,9 @@ pub fn register_builtin_tools() {
     office::register(&mut reg);
 }
 
+/// No-op: MCP tools are registered directly inside `crate::mcp::sync_mcp_tools`.
+/// This function is kept for API compatibility but has no effect.
+#[allow(unused_variables)]
 pub fn register_mcp_tool_executor(_provider_id: String, _tool_name: String) {}
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -202,6 +205,53 @@ mod tests {
         assert!(result.success);
         let tools = result.output["tools"].as_array().expect("tools array");
         assert!(tools.iter().any(|tool| tool["id"] == "pet.set_avatar"));
+    }
+
+    #[test]
+    fn tool_search_finds_file_tools_with_natural_queries() {
+        register_builtin_tools();
+
+        for query in ["file read", "read file", "list files", "workspace browse"] {
+            let result = execute_tool(
+                "tool.search",
+                &serde_json::json!({
+                    "q": query,
+                    "limit": 10
+                }),
+            )
+            .expect("tool.search");
+            let tools = result.output["tools"].as_array().expect("tools array");
+            assert!(
+                tools.iter().any(|tool| matches!(
+                    tool["id"].as_str(),
+                    Some("file.read") | Some("file.glob")
+                )),
+                "query {query:?} should find file.read or file.glob, got {tools:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_search_finds_agent_tools_with_compound_query() {
+        register_builtin_tools();
+
+        let result = execute_tool(
+            "tool.search",
+            &serde_json::json!({
+                "q": "agent start list running status",
+                "limit": 10
+            }),
+        )
+        .expect("tool.search");
+        let tools = result.output["tools"].as_array().expect("tools array");
+        assert!(
+            tools.iter().any(|tool| tool["id"] == "agent.start"),
+            "compound agent query should find agent.start, got {tools:?}"
+        );
+        assert!(
+            tools.iter().any(|tool| tool["id"] == "agent.read_output"),
+            "compound agent query should find agent.read_output, got {tools:?}"
+        );
     }
 
     #[test]
@@ -548,6 +598,7 @@ mod tests {
     #[test]
     fn file_glob_finds_files() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _guard = WorkspaceRootGuard::push(Some(dir.path().to_path_buf()));
         std::fs::write(dir.path().join("a.rs"), "fn main() {}").unwrap();
         std::fs::write(dir.path().join("b.txt"), "hello").unwrap();
         std::fs::create_dir(dir.path().join("sub")).unwrap();
@@ -556,7 +607,7 @@ mod tests {
 
         let result = execute_tool(
             "file.glob",
-            &serde_json::json!({ "pattern": "**/*.rs", "path": dir.path().display().to_string() }),
+            &serde_json::json!({ "pattern": "**/*.rs", "path": "." }),
         )
         .unwrap();
 
@@ -568,12 +619,13 @@ mod tests {
     #[test]
     fn file_grep_finds_matches() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _guard = WorkspaceRootGuard::push(Some(dir.path().to_path_buf()));
         std::fs::write(dir.path().join("test.rs"), "fn hello() {}\nfn world() {}\n").unwrap();
         register_builtin_tools();
 
         let result = execute_tool(
             "file.grep",
-            &serde_json::json!({ "pattern": "fn \\w+", "path": dir.path().display().to_string() }),
+            &serde_json::json!({ "pattern": "fn \\w+", "path": "." }),
         )
         .unwrap();
 
@@ -585,15 +637,13 @@ mod tests {
     #[test]
     fn file_read_returns_content_with_line_numbers() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _guard = WorkspaceRootGuard::push(Some(dir.path().to_path_buf()));
         let path = dir.path().join("test.txt");
         std::fs::write(&path, "line1\nline2\nline3\n").unwrap();
         register_builtin_tools();
 
-        let result = execute_tool(
-            "file.read",
-            &serde_json::json!({ "file_path": path.display().to_string() }),
-        )
-        .unwrap();
+        let result =
+            execute_tool("file.read", &serde_json::json!({ "file_path": "test.txt" })).unwrap();
 
         assert!(result.success);
         assert_eq!(result.output["total_lines"], 3);
@@ -603,15 +653,46 @@ mod tests {
     }
 
     #[test]
+    fn file_read_suggests_claude_skills_path_when_skill_segment_is_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _guard = WorkspaceRootGuard::push(Some(dir.path().to_path_buf()));
+        let actual = dir
+            .path()
+            .join("_claude_skill_probe")
+            .join(".claude")
+            .join("skills")
+            .join("dangerous-r3-observation-normalizer")
+            .join("references");
+        std::fs::create_dir_all(&actual).unwrap();
+        std::fs::write(actual.join("sample-spec.md"), "sample").unwrap();
+        register_builtin_tools();
+
+        let err = execute_tool(
+            "file.read",
+            &serde_json::json!({
+                "file_path": "_claude_skill_probe/dangerous-r3-observation-normalizer/references/sample-spec.md"
+            }),
+        )
+        .expect_err("missing skill path should fail with a suggestion");
+
+        let message = err.to_string();
+        assert!(message.contains("file not found"));
+        assert!(message.contains(".claude"));
+        assert!(message.contains("skills"));
+        assert!(message.contains("dangerous-r3-observation-normalizer"));
+    }
+
+    #[test]
     fn file_read_with_offset_and_limit() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _guard = WorkspaceRootGuard::push(Some(dir.path().to_path_buf()));
         let path = dir.path().join("test.txt");
         std::fs::write(&path, "a\nb\nc\nd\ne\n").unwrap();
         register_builtin_tools();
 
         let result = execute_tool(
             "file.read",
-            &serde_json::json!({ "file_path": path.display().to_string(), "offset": 1, "limit": 2 }),
+            &serde_json::json!({ "file_path": "test.txt", "offset": 1, "limit": 2 }),
         )
         .unwrap();
 
@@ -625,12 +706,13 @@ mod tests {
     #[test]
     fn file_write_creates_file() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _guard = WorkspaceRootGuard::push(Some(dir.path().to_path_buf()));
         let path = dir.path().join("out.txt");
         register_builtin_tools();
 
         let result = execute_tool(
             "file.write",
-            &serde_json::json!({ "file_path": path.display().to_string(), "content": "hello world" }),
+            &serde_json::json!({ "file_path": "out.txt", "content": "hello world" }),
         )
         .unwrap();
 
@@ -640,8 +722,33 @@ mod tests {
     }
 
     #[test]
+    fn file_append_appends_chunks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _guard = WorkspaceRootGuard::push(Some(dir.path().to_path_buf()));
+        let path = dir.path().join("out.txt");
+        register_builtin_tools();
+
+        let first = execute_tool(
+            "file.write",
+            &serde_json::json!({ "file_path": "out.txt", "content": "part 1\n" }),
+        )
+        .unwrap();
+        let second = execute_tool(
+            "file.append",
+            &serde_json::json!({ "file_path": "out.txt", "content": "part 2\n" }),
+        )
+        .unwrap();
+
+        assert!(first.success);
+        assert!(second.success);
+        assert_eq!(second.output["bytes_appended"], 7);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "part 1\npart 2\n");
+    }
+
+    #[test]
     fn file_edit_replaces_string() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _guard = WorkspaceRootGuard::push(Some(dir.path().to_path_buf()));
         let path = dir.path().join("edit.txt");
         std::fs::write(&path, "hello world\nhello rust\n").unwrap();
         register_builtin_tools();
@@ -649,7 +756,7 @@ mod tests {
         let result = execute_tool(
             "file.edit",
             &serde_json::json!({
-                "file_path": path.display().to_string(),
+                "file_path": "edit.txt",
                 "old_string": "hello",
                 "new_string": "bye",
                 "replace_all": true
@@ -667,6 +774,7 @@ mod tests {
     #[test]
     fn file_edit_fails_when_old_string_not_found() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _guard = WorkspaceRootGuard::push(Some(dir.path().to_path_buf()));
         let path = dir.path().join("edit.txt");
         std::fs::write(&path, "hello world").unwrap();
         register_builtin_tools();
@@ -674,7 +782,7 @@ mod tests {
         let result = execute_tool(
             "file.edit",
             &serde_json::json!({
-                "file_path": path.display().to_string(),
+                "file_path": "edit.txt",
                 "old_string": "notfound",
                 "new_string": "bye"
             }),
@@ -688,15 +796,13 @@ mod tests {
     #[test]
     fn file_stat_returns_metadata() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _guard = WorkspaceRootGuard::push(Some(dir.path().to_path_buf()));
         let path = dir.path().join("meta.txt");
         std::fs::write(&path, "content").unwrap();
         register_builtin_tools();
 
-        let result = execute_tool(
-            "file.stat",
-            &serde_json::json!({ "file_path": path.display().to_string() }),
-        )
-        .unwrap();
+        let result =
+            execute_tool("file.stat", &serde_json::json!({ "file_path": "meta.txt" })).unwrap();
 
         assert!(result.success);
         assert_eq!(result.output["size"], 7);

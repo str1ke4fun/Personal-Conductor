@@ -81,7 +81,7 @@ export function PermissionCard({
     >
       <div className="permission-header" onClick={() => setExpanded(!expanded)}>
         <span className="permission-icon">
-          {isPending ? '[?]' : isDenied ? '[X]' : isApproved ? '[OK]' : '[!]'}
+          {isPending ? '⏸' : isDenied ? '✗' : isApproved ? '✓' : '⊘'}
         </span>
         <span className="permission-tool">{toolName}</span>
         {riskLevel && (
@@ -89,10 +89,10 @@ export function PermissionCard({
         )}
         <span className="permission-summary">{summary}</span>
         {isPending && (
-          <span className="permission-awaiting-badge">Needs approval</span>
+          <span className="permission-awaiting-badge">需要批准</span>
         )}
-        {isDenied && <span className="permission-denied-badge">Denied</span>}
-        <span className="permission-expand">{expanded ? '[-]' : '[+]'}</span>
+        {isDenied && <span className="permission-denied-badge">已拒绝</span>}
+        <span className="permission-expand">{expanded ? '▼' : '▶'}</span>
       </div>
 
       {isPending && proposalId && (onApprove || onReject) && (
@@ -107,7 +107,7 @@ export function PermissionCard({
               }}
               disabled={busy}
             >
-              Approve
+              批准
             </button>
           )}
           {onApproveOnce && (
@@ -120,7 +120,7 @@ export function PermissionCard({
               }}
               disabled={busy}
             >
-              Approve once
+              仅此一次
             </button>
           )}
           {onReject && (
@@ -133,7 +133,7 @@ export function PermissionCard({
               }}
               disabled={busy}
             >
-              Reject
+              拒绝
             </button>
           )}
         </div>

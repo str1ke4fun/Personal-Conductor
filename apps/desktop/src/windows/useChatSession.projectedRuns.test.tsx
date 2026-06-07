@@ -6,7 +6,8 @@ const mocks = vi.hoisted(() => {
   const listeners = new Map<string, (event: { payload: any }) => void>();
   return {
     listeners,
-    getChatSessionMessagesMock: vi.fn(),
+    getChatMessageProjectionsMock: vi.fn(),
+    getChatSessionMessagesV2Mock: vi.fn(),
     listChatMessagesMock: vi.fn(),
     getCommandRunMock: vi.fn(),
     approveProposalMock: vi.fn(),
@@ -35,7 +36,8 @@ vi.mock('@tauri-apps/api/window', () => ({
 
 vi.mock('../ipc/invoke', () => ({
   api: {
-    getChatSessionMessages: mocks.getChatSessionMessagesMock,
+    getChatMessageProjections: mocks.getChatMessageProjectionsMock,
+    getChatSessionMessagesV2: mocks.getChatSessionMessagesV2Mock,
     listChatMessages: mocks.listChatMessagesMock,
     getCommandRun: mocks.getCommandRunMock,
     approveProposal: mocks.approveProposalMock,
@@ -99,7 +101,8 @@ function PrimaryRunHarness() {
 describe('useChatSession projected runs', () => {
   beforeEach(() => {
     mocks.listeners.clear();
-    mocks.getChatSessionMessagesMock.mockReset();
+    mocks.getChatMessageProjectionsMock.mockReset();
+    mocks.getChatSessionMessagesV2Mock.mockReset();
     mocks.listChatMessagesMock.mockReset();
     mocks.getCommandRunMock.mockReset();
     mocks.approveProposalMock.mockReset();
@@ -108,14 +111,16 @@ describe('useChatSession projected runs', () => {
     mocks.updateGoalStatusMock.mockReset();
     mocks.createChatSessionMock.mockReset();
     mocks.sendChatMessageV2Mock.mockReset();
-    mocks.getChatSessionMessagesMock.mockResolvedValue([]);
+    // projections empty → fallback to V2 mock (which tests inject data into)
+    mocks.getChatMessageProjectionsMock.mockResolvedValue([]);
+    mocks.getChatSessionMessagesV2Mock.mockResolvedValue([]);
   });
 
   it('projects background thinking, tools, and persisted replies into the active session', async () => {
     render(<Harness />);
 
     await waitFor(() => {
-      expect(mocks.getChatSessionMessagesMock).toHaveBeenCalledWith('session-1');
+      expect(mocks.getChatSessionMessagesV2Mock).toHaveBeenCalledWith('session-1');
     });
 
     await act(async () => {
@@ -163,7 +168,7 @@ describe('useChatSession projected runs', () => {
     expect(screen.getByTestId('projected-text').textContent).toBe('partial output');
     expect(screen.getByTestId('projected-tools').textContent).toBe('1');
 
-    mocks.getChatSessionMessagesMock.mockResolvedValueOnce([
+    mocks.getChatSessionMessagesV2Mock.mockResolvedValueOnce([
       {
         id: 'assistant-1',
         role: 'assistant',
@@ -190,7 +195,7 @@ describe('useChatSession projected runs', () => {
     expect(screen.getByTestId('projected-phase').textContent).toBe('synthesizing');
     expect(screen.getByTestId('projected-thinking').textContent).toBe('正在写回可审阅结果...');
 
-    mocks.getChatSessionMessagesMock.mockResolvedValueOnce([
+    mocks.getChatSessionMessagesV2Mock.mockResolvedValueOnce([
       {
         id: 'assistant-early',
         role: 'assistant',
@@ -236,7 +241,7 @@ describe('useChatSession projected runs', () => {
     render(<PrimaryRunHarness />);
 
     await waitFor(() => {
-      expect(mocks.getChatSessionMessagesMock).toHaveBeenCalledWith('session-1');
+      expect(mocks.getChatSessionMessagesV2Mock).toHaveBeenCalledWith('session-1');
     });
 
     fireEvent.change(screen.getByLabelText('chat-input'), { target: { value: 'inspect the repo' } });
@@ -285,7 +290,7 @@ describe('useChatSession projected runs', () => {
     expect(screen.getByTestId('primary-tools').textContent).toBe('1');
     expect(screen.getByTestId('primary-projected-count').textContent).toBe('0');
 
-    mocks.getChatSessionMessagesMock.mockResolvedValueOnce([
+    mocks.getChatSessionMessagesV2Mock.mockResolvedValueOnce([
       {
         id: 'user-1',
         role: 'user',

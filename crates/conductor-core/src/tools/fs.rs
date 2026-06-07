@@ -5,6 +5,8 @@ use super::registry::{
     ToolExecutionResult, ToolPermission, ToolProviderKind, ToolRegistry, ToolSpec,
 };
 use super::{current_workspace_root, display_path, resolve_workspace_path};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 
 fn glob_to_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
     let mut re = String::from("^");
@@ -58,6 +60,47 @@ fn is_binary_extension(ext: &str) -> bool {
             | "ppt"
             | "pptx"
     )
+}
+
+fn suggest_claude_skills_path(path: &Path) -> Option<PathBuf> {
+    if path.exists() {
+        return None;
+    }
+
+    for skill_root in path.ancestors().skip(1) {
+        let Some(skill_name) = skill_root.file_name() else {
+            continue;
+        };
+        let Some(parent) = skill_root.parent() else {
+            continue;
+        };
+        let candidate_root = parent.join(".claude").join("skills").join(skill_name);
+        if !candidate_root.exists() {
+            continue;
+        }
+        let Ok(relative_tail) = path.strip_prefix(skill_root) else {
+            continue;
+        };
+        let candidate = candidate_root.join(relative_tail);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+fn file_read_error(path: &Path, err: std::io::Error) -> anyhow::Error {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        if let Some(suggestion) = suggest_claude_skills_path(path) {
+            return anyhow::anyhow!(
+                "file not found: {}; did you mean {}?",
+                display_path(path),
+                display_path(&suggestion)
+            );
+        }
+    }
+    anyhow::Error::new(err)
 }
 
 fn execute_file_glob(
@@ -198,7 +241,7 @@ fn execute_file_read(
     match ext {
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" => {
             // Image files: return metadata only (Phase 3 will add base64)
-            let metadata = std::fs::metadata(&path)?;
+            let metadata = std::fs::metadata(&path).map_err(|err| file_read_error(&path, err))?;
             Ok(ToolExecutionResult {
                 success: true,
                 output: serde_json::json!({
@@ -216,7 +259,8 @@ fn execute_file_read(
             let offset = input.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             let limit = input.get("limit").and_then(|v| v.as_u64()).unwrap_or(2000) as usize;
 
-            let content = std::fs::read_to_string(&path)?;
+            let content =
+                std::fs::read_to_string(&path).map_err(|err| file_read_error(&path, err))?;
             let lines: Vec<&str> = content.lines().collect();
             let start = offset.min(lines.len());
             let end = (start + limit).min(lines.len());
@@ -277,6 +321,50 @@ fn execute_file_write(
             "absolute_path": resolved.display().to_string(),
             "workspace_root": workspace_root.display().to_string(),
             "bytes": content.len()
+        }),
+        error: None,
+        duration_ms: 0,
+    })
+}
+
+fn execute_file_append(
+    _spec: &ToolSpec,
+    input: &serde_json::Value,
+) -> Result<ToolExecutionResult, anyhow::Error> {
+    let path = input
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing file_path"))?;
+    let content = input
+        .get("content")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing content"))?;
+
+    let resolved = resolve_workspace_path(path)?;
+
+    if let Some(parent) = resolved.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&resolved)?;
+    file.write_all(content.as_bytes())?;
+
+    let display = display_path(&resolved);
+    let workspace_root = current_workspace_root();
+    let size = std::fs::metadata(&resolved)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+
+    Ok(ToolExecutionResult {
+        success: true,
+        output: serde_json::json!({
+            "path": display,
+            "absolute_path": resolved.display().to_string(),
+            "workspace_root": workspace_root.display().to_string(),
+            "bytes_appended": content.len(),
+            "size": size
         }),
         error: None,
         duration_ms: 0,
@@ -469,7 +557,7 @@ pub(super) fn register(registry: &mut ToolRegistry) {
         ToolSpec {
             id: "file.write".to_string(),
             name: "写入文件".to_string(),
-            description: "将内容写入文件（自动创建父目录）".to_string(),
+            description: "将内容写入文件（自动创建父目录）。长报告优先先写入短标题/首段，再用 file.append 分块追加，避免单次工具参数过长。".to_string(),
             provider: ToolProviderKind::Internal,
             input_schema: serde_json::json!({
                 "type": "object",
@@ -492,6 +580,36 @@ pub(super) fn register(registry: &mut ToolRegistry) {
             workspace_required: true,
         },
         execute_file_write,
+    );
+
+    registry.register(
+        ToolSpec {
+            id: "file.append".to_string(),
+            name: "追加写入文件".to_string(),
+            description: "向文件末尾追加内容（自动创建父目录），适合把长报告拆成多个较小片段写入。".to_string(),
+            provider: ToolProviderKind::Internal,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "文件路径" },
+                    "content": { "type": "string", "description": "追加内容；长文本请拆成多个较小片段" }
+                },
+                "required": ["file_path", "content"]
+            }),
+            output_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "bytes_appended": { "type": "integer" },
+                    "size": { "type": "integer" }
+                }
+            }),
+            risk_level: RiskLevel::WorkspaceWrite,
+            permissions: vec![ToolPermission::WriteWorkspace],
+            supports_dry_run: false,
+            workspace_required: true,
+        },
+        execute_file_append,
     );
 
     registry.register(

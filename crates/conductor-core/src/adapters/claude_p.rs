@@ -487,9 +487,14 @@ async fn finish_run(run_id: &str, task_id: &str, finish: SpawnFinish) -> anyhow:
         }
         SpawnFinish::TimedOut => {
             run.status = AgentRunStatus::Failed;
-            run.error = Some("claude timed out".to_string());
-            let output_ref =
-                write_run_output(run_id, "", &run.error.clone().unwrap_or_default()).await?;
+            let timeout_error = "claude timed out";
+            run.error = Some(timeout_error.to_string());
+            let stderr = if stderr.trim().is_empty() {
+                timeout_error.to_string()
+            } else {
+                format!("{}\n{}", stderr.trim_end(), timeout_error)
+            };
+            let output_ref = write_run_output(run_id, &stdout, &stderr).await?;
             run.output_ref = Some(output_ref);
         }
     }

@@ -405,6 +405,7 @@ pub async fn execute_proposal(id: &str) -> anyhow::Result<crate::tools::ToolExec
         id: tool_call_id.clone(),
         session_id: None,
         workspace_id: proposal.workspace_id.clone(),
+        turn_id: None,
         llm_tool_call_id: None,
         tool_id: tool_id.clone(),
         input_json,

@@ -330,6 +330,292 @@ pub async fn emit_permission_revoked(grant_id: &str, tool_id: &str) {
     let _ = append_event(&event).await;
 }
 
+/// Emit a `model.routed` event when ModelResolver picks a model. (C1)
+///
+/// When `request_id` is `Some`, the event is also written to `chat_turn_events`
+/// so the model selection is visible in the per-turn timeline.
+pub async fn emit_model_routed(
+    caller: &str,
+    model_id: &str,
+    profile_id: Option<&str>,
+    policy_id: Option<&str>,
+    fallback_used: bool,
+    request_id: Option<&str>,
+) {
+    let event = AuditEvent {
+        timestamp: Utc::now(),
+        source: "model_resolver".into(),
+        event_type: "model.routed".into(),
+        actor: caller.to_string(),
+        target: model_id.to_string(),
+        detail: serde_json::json!({
+            "profile_id": profile_id,
+            "policy_id": policy_id,
+            "fallback_used": fallback_used,
+        }),
+        session_id: None,
+    };
+    let _ = append_event(&event).await;
+
+    if let Some(rid) = request_id {
+        let payload = serde_json::json!({
+            "caller": caller,
+            "model_id": model_id,
+            "profile_id": profile_id,
+            "policy_id": policy_id,
+            "fallback_used": fallback_used,
+        });
+        let _ = crate::chat::append_turn_event_by_request(
+            rid,
+            "model.routed",
+            None,
+            "system",
+            None,
+            payload,
+        )
+        .await;
+    }
+}
+
+/// Emit an `ooda.phase_changed` event when the OODA loop advances. (C1)
+///
+/// When `request_id` is `Some`, the event is also written to `chat_turn_events`
+/// so the OODA phase transition is visible in the per-turn timeline.
+pub async fn emit_ooda_phase_changed(
+    goal_id: &str,
+    from_phase: &str,
+    to_phase: &str,
+    reason: &str,
+    request_id: Option<&str>,
+) {
+    let event = AuditEvent {
+        timestamp: Utc::now(),
+        source: "goal_orchestrator".into(),
+        event_type: "ooda.phase_changed".into(),
+        actor: goal_id.to_string(),
+        target: goal_id.to_string(),
+        detail: serde_json::json!({
+            "from": from_phase,
+            "to": to_phase,
+            "reason": reason,
+        }),
+        session_id: None,
+    };
+    let _ = append_event(&event).await;
+
+    if let Some(rid) = request_id {
+        let payload = serde_json::json!({
+            "goal_id": goal_id,
+            "from": from_phase,
+            "to": to_phase,
+            "reason": reason,
+        });
+        let _ = crate::chat::append_turn_event_by_request(
+            rid,
+            "ooda.phase_changed",
+            Some(to_phase),
+            "system",
+            None,
+            payload,
+        )
+        .await;
+    }
+}
+
+/// Emit a `user.presence.changed` event when presence state changes. (P0-7)
+pub async fn emit_presence_changed(from: &str, to: &str) {
+    let event = AuditEvent {
+        timestamp: Utc::now(),
+        source: "user_presence".into(),
+        event_type: "user.presence.changed".into(),
+        actor: "user".to_string(),
+        target: to.to_string(),
+        detail: serde_json::json!({ "from": from, "to": to }),
+        session_id: None,
+    };
+    let _ = append_event(&event).await;
+}
+
+/// Emit `goal_task.execution_started` when chat executor begins a task. (P0-D)
+///
+/// When `request_id` is `Some`, the event is also written to `chat_turn_events`
+/// so the task execution start is visible in the per-turn timeline.
+pub async fn emit_goal_task_execution_started(
+    task_id: &str,
+    goal_id: Option<&str>,
+    cycle_id: Option<&str>,
+    request_id: Option<&str>,
+) {
+    let event = AuditEvent {
+        timestamp: Utc::now(),
+        source: "goal_task_executor".into(),
+        event_type: "goal_task.execution_started".into(),
+        actor: "worker".to_string(),
+        target: task_id.to_string(),
+        detail: serde_json::json!({
+            "task_id": task_id,
+            "goal_id": goal_id,
+            "cycle_id": cycle_id,
+            "request_id": request_id,
+        }),
+        session_id: None,
+    };
+    let _ = append_event(&event).await;
+
+    if let Some(rid) = request_id {
+        let payload = serde_json::json!({
+            "task_id": task_id,
+            "goal_id": goal_id,
+            "cycle_id": cycle_id,
+        });
+        let _ = crate::chat::append_turn_event_by_request(
+            rid,
+            "goal_task.execution_started",
+            Some("executing"),
+            "system",
+            None,
+            payload,
+        )
+        .await;
+    }
+}
+
+/// Emit `goal_task.result_projected` after successful writeback. (P0-D / S4)
+///
+/// When `request_id` is `Some`, the event is also written to `chat_turn_events`
+/// so the task result projection is visible in the per-turn timeline.
+pub async fn emit_goal_task_result_projected(
+    task_id: &str,
+    result_ref: &str,
+    turn_id: Option<&str>,
+    request_id: Option<&str>,
+) {
+    let event = AuditEvent {
+        timestamp: Utc::now(),
+        source: "goal_task_executor".into(),
+        event_type: "goal_task.result_projected".into(),
+        actor: "worker".to_string(),
+        target: task_id.to_string(),
+        detail: serde_json::json!({
+            "task_id": task_id,
+            "result_ref": result_ref,
+            "turn_id": turn_id,
+        }),
+        session_id: None,
+    };
+    let _ = append_event(&event).await;
+
+    if let Some(rid) = request_id {
+        let payload = serde_json::json!({
+            "task_id": task_id,
+            "result_ref": result_ref,
+            "turn_id": turn_id,
+        });
+        let _ = crate::chat::append_turn_event_by_request(
+            rid,
+            "goal_task.result_projected",
+            Some("result_projected"),
+            "system",
+            None,
+            payload,
+        )
+        .await;
+    }
+}
+
+/// Emit `goal_task.writeback_failed` on writeback/execution failure. (P0-D / S4)
+///
+/// When `request_id` is `Some`, the event is also written to `chat_turn_events`
+/// so the failure is visible in the per-turn timeline alongside started/result_projected.
+pub async fn emit_goal_task_writeback_failed(
+    task_id: &str,
+    reason: &str,
+    request_id: Option<&str>,
+) {
+    let event = AuditEvent {
+        timestamp: Utc::now(),
+        source: "goal_task_executor".into(),
+        event_type: "goal_task.writeback_failed".into(),
+        actor: "worker".to_string(),
+        target: task_id.to_string(),
+        detail: serde_json::json!({ "task_id": task_id, "reason": reason }),
+        session_id: None,
+    };
+    let _ = append_event(&event).await;
+
+    if let Some(rid) = request_id {
+        let payload = serde_json::json!({
+            "task_id": task_id,
+            "reason": reason,
+        });
+        let _ = crate::chat::append_turn_event_by_request(
+            rid,
+            "goal_task.writeback_failed",
+            Some("writeback_failed"),
+            "system",
+            None,
+            payload,
+        )
+        .await;
+    }
+}
+
+/// Emit `agent_team.lifecycle_changed` when team lifecycle transitions. (S3)
+pub async fn emit_agent_team_lifecycle_changed(
+    team_id: &str,
+    from: &str,
+    to: &str,
+    goal_id: Option<&str>,
+) {
+    let event = AuditEvent {
+        timestamp: Utc::now(),
+        source: "agent_teams".into(),
+        event_type: "agent_team.lifecycle_changed".into(),
+        actor: team_id.to_string(),
+        target: to.to_string(),
+        detail: serde_json::json!({ "team_id": team_id, "from": from, "to": to, "goal_id": goal_id }),
+        session_id: None,
+    };
+    let _ = append_event(&event).await;
+}
+
+/// Emit `agent_team.member_status_changed` when a member status changes. (S3)
+pub async fn emit_agent_team_member_status_changed(
+    team_id: &str,
+    agent_id: &str,
+    from: &str,
+    to: &str,
+    task_id: Option<&str>,
+) {
+    let event = AuditEvent {
+        timestamp: Utc::now(),
+        source: "agent_teams".into(),
+        event_type: "agent_team.member_status_changed".into(),
+        actor: agent_id.to_string(),
+        target: to.to_string(),
+        detail: serde_json::json!({
+            "team_id": team_id, "agent_id": agent_id,
+            "from": from, "to": to, "task_id": task_id
+        }),
+        session_id: None,
+    };
+    let _ = append_event(&event).await;
+}
+
+/// Emit `agent_team.member_run_bound` when a member is linked to an agent run. (S3)
+pub async fn emit_agent_team_member_run_bound(team_id: &str, agent_id: &str, run_id: &str) {
+    let event = AuditEvent {
+        timestamp: Utc::now(),
+        source: "agent_teams".into(),
+        event_type: "agent_team.member_run_bound".into(),
+        actor: agent_id.to_string(),
+        target: run_id.to_string(),
+        detail: serde_json::json!({ "team_id": team_id, "agent_id": agent_id, "run_id": run_id }),
+        session_id: None,
+    };
+    let _ = append_event(&event).await;
+}
+
 /// Query events from the NDJSON log with optional filters.
 ///
 /// Results are sorted newest-first and capped at `limit` (default 100).

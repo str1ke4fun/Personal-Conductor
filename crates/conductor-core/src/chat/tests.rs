@@ -668,10 +668,6 @@ async fn prompt_includes_memory_context_when_entries_exist() {
         "prompt should contain memory context section when memories exist"
     );
     assert!(
-        prompt.contains("preference"),
-        "prompt should contain the memory category"
-    );
-    assert!(
         prompt.contains("fav_color"),
         "prompt should contain the memory key"
     );
@@ -744,7 +740,7 @@ async fn prompt_skips_memory_context_when_empty() {
 }
 
 #[tokio::test]
-async fn prompt_groups_entries_by_category() {
+async fn prompt_includes_multiple_memory_entries() {
     let _root = TestRoot::new();
     crate::memory::init_db().await.expect("init memory db");
     crate::expression::init_db()
@@ -771,14 +767,162 @@ async fn prompt_groups_entries_by_category() {
         prompt.contains("## 记忆上下文"),
         "prompt should contain memory context section"
     );
-    // Categories should appear as subsection headers
     assert!(
-        prompt.contains("### coding"),
-        "prompt should contain coding category header"
+        prompt.contains("lang_pref"),
+        "prompt should contain the coding memory key"
     );
     assert!(
-        prompt.contains("### food"),
-        "prompt should contain food category header"
+        prompt.contains("food_pref"),
+        "prompt should contain the food memory key"
+    );
+}
+
+#[tokio::test]
+async fn prompt_uses_workspace_scoped_memory_context() {
+    let _root = TestRoot::new();
+    crate::memory::init_db().await.expect("init memory db");
+    crate::expression::init_db()
+        .await
+        .expect("init expression db");
+    crate::affection::init_db()
+        .await
+        .expect("init affection db");
+    crate::memory::set_embedding_model(Box::new(crate::memory::HashEmbeddingModel::default()));
+
+    crate::memory::set_for_workspace(
+        "auth_module",
+        "workspace alpha authentication guidance",
+        "project",
+        "ws-alpha",
+        "user",
+    )
+    .await
+    .expect("set workspace alpha memory");
+    crate::memory::set_for_workspace(
+        "auth_module",
+        "workspace beta authentication guidance",
+        "project",
+        "ws-beta",
+        "user",
+    )
+    .await
+    .expect("set workspace beta memory");
+
+    let config = default_config();
+    let tasks: Vec<Task> = vec![];
+    let alpha_prompt = prompt::build_system_prompt_with_context(
+        &tasks,
+        &config,
+        "authentication guidance",
+        None,
+        Some("ws-alpha"),
+        Some("crates/conductor-core/src/chat"),
+        None,
+        None,
+    )
+    .await;
+    let beta_prompt = prompt::build_system_prompt_with_context(
+        &tasks,
+        &config,
+        "authentication guidance",
+        None,
+        Some("ws-beta"),
+        Some("apps/desktop/src"),
+        None,
+        None,
+    )
+    .await;
+
+    assert!(
+        alpha_prompt.contains("workspace alpha authentication guidance"),
+        "alpha workspace prompt should include alpha-scoped memory"
+    );
+    assert!(
+        !alpha_prompt.contains("workspace beta authentication guidance"),
+        "alpha workspace prompt should exclude beta-scoped memory"
+    );
+    assert!(
+        beta_prompt.contains("workspace beta authentication guidance"),
+        "beta workspace prompt should include beta-scoped memory"
+    );
+}
+
+#[tokio::test]
+async fn prompt_uses_session_and_goal_scoped_memory_context() {
+    let _root = TestRoot::new();
+    crate::memory::init_db().await.expect("init memory db");
+    crate::expression::init_db()
+        .await
+        .expect("init expression db");
+    crate::affection::init_db()
+        .await
+        .expect("init affection db");
+    crate::memory::set_embedding_model(Box::new(crate::memory::HashEmbeddingModel::default()));
+
+    let matching = crate::memory::set(
+        "prompt_scope_matching",
+        "amber falcon prompt memory from matching session",
+        "project",
+    )
+    .await
+    .expect("set matching memory");
+    let other = crate::memory::set(
+        "prompt_scope_other",
+        "amber falcon prompt memory from other session",
+        "project",
+    )
+    .await
+    .expect("set other memory");
+
+    let pool = crate::db::pool().await.expect("pool");
+    sqlx::query(
+        r#"
+        UPDATE memory_entries
+        SET source_session_id = ?1, goal_id = ?2
+        WHERE id = ?3
+        "#,
+    )
+    .bind("session-a")
+    .bind("goal-a")
+    .bind(&matching.id)
+    .execute(&pool)
+    .await
+    .expect("tag matching memory");
+    sqlx::query(
+        r#"
+        UPDATE memory_entries
+        SET source_session_id = ?1, goal_id = ?2
+        WHERE id = ?3
+        "#,
+    )
+    .bind("session-b")
+    .bind("goal-b")
+    .bind(&other.id)
+    .execute(&pool)
+    .await
+    .expect("tag other memory");
+
+    let config = default_config();
+    let tasks: Vec<Task> = vec![];
+    let prompt = prompt::build_system_prompt_with_context(
+        &tasks,
+        &config,
+        "amber falcon prompt memory",
+        None,
+        None,
+        None,
+        Some("session-a"),
+        Some("goal-a"),
+    )
+    .await;
+
+    assert!(
+        prompt.contains("amber falcon prompt memory from matching session"),
+        "prompt should include memory from the active session and goal"
+    );
+    assert!(
+        !prompt.contains("amber falcon prompt memory from other session"),
+        "prompt should exclude memory from another explicit session and goal"
     );
 }
 

@@ -1,4 +1,14 @@
 // Review phase: collect verdicts from completed tasks and decide next step
+//
+// BC-4 (contracts wiring): This phase is entirely programmatic — it inspects
+// task statuses from `ObserveReport` using deterministic logic and never calls
+// an LLM or parses raw LLM output.  There is therefore no contract validation
+// to add here.  The `validate_reason_output` contract is wired into the LLM
+// path in `decide.rs::decide_llm`, which is the only OODA phase that currently
+// produces raw LLM text.  If a future `review_llm` function is added that calls
+// a model to produce a structured verdict, it must validate via
+// `contracts::validate_reason_output` (or a dedicated `ReviewOutput` contract)
+// before accepting the result.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -16,6 +26,9 @@ pub struct ReviewVerdict {
     pub notes: String,
     /// Hint for the next cycle if rework is needed
     pub next_cycle_hint: Option<String>,
+    /// The request_id of the ChatTurn associated with this cycle, if any.
+    /// Provides the bidirectional anchor between GoalCycle and ChatTurn.
+    pub chat_turn_request_id: Option<String>,
 }
 
 /// Collect verdicts from the current cycle's tasks and determine next step.
@@ -28,6 +41,7 @@ pub fn review(report: &ObserveReport) -> Result<ReviewVerdict> {
             rework_required: false,
             notes: "no tasks to review".to_string(),
             next_cycle_hint: Some("create tasks first".to_string()),
+            chat_turn_request_id: None,
         });
     }
 
@@ -51,6 +65,7 @@ pub fn review(report: &ObserveReport) -> Result<ReviewVerdict> {
             rework_required: false,
             notes: format!("all {} tasks accepted", total),
             next_cycle_hint: None,
+            chat_turn_request_id: None,
         });
     }
 
@@ -66,6 +81,7 @@ pub fn review(report: &ObserveReport) -> Result<ReviewVerdict> {
             rework_required: true,
             notes: format!("{} tasks failed: {:?}", failed_count, failed_tasks),
             next_cycle_hint: Some(format!("retry failed tasks: {:?}", failed_tasks)),
+            chat_turn_request_id: None,
         });
     }
 
@@ -76,6 +92,7 @@ pub fn review(report: &ObserveReport) -> Result<ReviewVerdict> {
             rework_required: false,
             notes: format!("{} tasks blocked, waiting for resolution", blocked_count),
             next_cycle_hint: None,
+            chat_turn_request_id: None,
         });
     }
 
@@ -86,6 +103,7 @@ pub fn review(report: &ObserveReport) -> Result<ReviewVerdict> {
             rework_required: true,
             notes: format!("{} tasks need rework", rework_count),
             next_cycle_hint: Some("rework failed tasks".to_string()),
+            chat_turn_request_id: None,
         });
     }
 
@@ -96,6 +114,7 @@ pub fn review(report: &ObserveReport) -> Result<ReviewVerdict> {
             rework_required: false,
             notes: format!("{} tasks still running", running_count),
             next_cycle_hint: None,
+            chat_turn_request_id: None,
         });
     }
 
@@ -108,7 +127,21 @@ pub fn review(report: &ObserveReport) -> Result<ReviewVerdict> {
             accepted_count, total, running_count, blocked_count
         ),
         next_cycle_hint: None,
+        chat_turn_request_id: None,
     })
+}
+
+/// Review with ChatTurn lookup: produces the same verdict as [`review`] but also
+/// resolves the `chat_turn_request_id` anchor by looking up the ChatTurn
+/// associated with the current cycle.
+pub async fn review_with_turn(report: &ObserveReport) -> Result<ReviewVerdict> {
+    let mut verdict = review(report)?;
+    if let Some(ref cycle) = report.current_cycle {
+        if let Ok(Some(turn)) = crate::chat::get_turn_by_goal_cycle_id(&cycle.id).await {
+            verdict.chat_turn_request_id = Some(turn.request_id);
+        }
+    }
+    Ok(verdict)
 }
 
 #[cfg(test)]
@@ -174,15 +207,18 @@ mod tests {
                 orientation_json: None,
                 dispatch_plan_id: None,
                 review_summary_ref: None,
+                last_graph_hash: None,
                 started_at: now,
                 updated_at: now,
                 finished_at: None,
             }),
+            facts: vec![],
             active_tasks: tasks,
             heartbeats: vec![],
             active_leases: vec![],
             recent_events: vec![],
             unread_messages: vec![],
+            recent_hints: vec![],
         }
     }
 

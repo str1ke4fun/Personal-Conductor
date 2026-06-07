@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Personal Conductor",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "identifier": "local.personal.conductor",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -77,7 +77,16 @@
   },
   "bundle": {
     "active": false,
-    "targets": "all",
-    "resources": ["resources/live2d/**/*"]
+    "targets": ["nsis"],
+    "resources": {
+      "resources/state-template": "state-template"
+    },
+    "icon": ["icons/icon.ico"],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      }
+    }
   }
 }

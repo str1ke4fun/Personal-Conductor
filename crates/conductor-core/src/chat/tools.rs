@@ -404,6 +404,7 @@ pub(super) async fn maybe_create_external_access_proposal(
     let target = args
         .get("path")
         .and_then(|value| value.as_str())
+        .or_else(|| args.get("file_path").and_then(|value| value.as_str()))
         .or_else(|| args.get("working_dir").and_then(|value| value.as_str()))
         .unwrap_or("<unknown path>");
     let tool_input_json = serde_json::to_string(args)?;
@@ -424,7 +425,7 @@ pub(super) async fn maybe_create_external_access_proposal(
     }
     let title = match tool_id {
         "file.read" => format!("读取工作区外路径 {target}"),
-        "file.write" => format!("写入工作区外路径 {target}"),
+        "file.write" | "file.append" => format!("写入工作区外路径 {target}"),
         "file.edit" => format!("修改工作区外路径 {target}"),
         "file.glob" => format!("扫描工作区外路径 {target}"),
         "file.grep" => format!("搜索工作区外路径 {target}"),
@@ -442,7 +443,7 @@ pub(super) async fn maybe_create_external_access_proposal(
         target
     );
     let risk_level = match tool_id {
-        "file.write" | "file.edit" | "bash.execute" => {
+        "file.write" | "file.append" | "file.edit" | "bash.execute" => {
             crate::proposals::RiskLevel::ExternalSideEffect
         }
         _ => crate::proposals::RiskLevel::ReadOnly,
@@ -486,18 +487,97 @@ pub(super) async fn maybe_create_external_access_proposal(
 }
 
 #[cfg(feature = "tauri-events")]
+async fn mirror_tool_turn_event(
+    request_id: Option<&str>,
+    event_type: &str,
+    tool_call_id: &str,
+    tool_id: &str,
+    status: &str,
+    payload_json: serde_json::Value,
+) {
+    let Some(request_id) = request_id else {
+        return;
+    };
+
+    let _ = super::turns::append_tool_event_by_request(
+        request_id,
+        event_type,
+        tool_call_id,
+        tool_id,
+        status,
+        payload_json,
+    )
+    .await;
+}
+
+#[cfg(any(test, feature = "tauri-events"))]
+fn truncate_argument_preview(raw: &str, max_chars: usize) -> String {
+    let char_count = raw.chars().count();
+    if char_count <= max_chars {
+        return raw.to_string();
+    }
+    let mut preview: String = raw.chars().take(max_chars).collect();
+    preview.push_str("...(truncated)");
+    preview
+}
+
+#[cfg(any(test, feature = "tauri-events"))]
+fn json_value_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+#[cfg(any(test, feature = "tauri-events"))]
+fn parse_tool_call_arguments(raw: &str) -> Result<serde_json::Value, String> {
+    let value = serde_json::from_str::<serde_json::Value>(raw).map_err(|err| {
+        format!(
+            "invalid tool arguments JSON: {err}. The tool call arguments were likely truncated by the model/provider. Retry with valid JSON; for long file output, write smaller chunks and append them instead of sending one huge content field. raw_arguments_preview={}",
+            truncate_argument_preview(raw, 600)
+        )
+    })?;
+    if !value.is_object() {
+        return Err(format!(
+            "tool arguments must be a JSON object, got {}. raw_arguments_preview={}",
+            json_value_kind(&value),
+            truncate_argument_preview(raw, 600)
+        ));
+    }
+    Ok(value)
+}
+
+#[cfg(feature = "tauri-events")]
 pub(super) async fn execute_tool_call(
     tc: &crate::llm::ToolCall,
     session_id: Option<&str>,
     workspace_id: Option<&str>,
     approved_write_scope: Option<&[String]>,
+    request_id: Option<&str>,
     app_handle: &tauri::AppHandle,
 ) -> (String, bool, u64, &'static str) {
-    let args: serde_json::Value =
-        serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::json!({}));
     let tool_id = tool_id_from_llm_name(&tc.function.name);
+    let parsed_args = parse_tool_call_arguments(&tc.function.arguments);
+    let args = parsed_args
+        .as_ref()
+        .ok()
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
     let risk_level =
         crate::tools::get_tool(&tool_id).map(|(spec, _)| spec.risk_level.as_str().to_string());
+    let turn_id = if let Some(request_id) = request_id {
+        super::turns::find_turn_by_request_id(request_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|turn| turn.id)
+    } else {
+        None
+    };
 
     // Record ToolCall before execution
     let tc_id = uuid::Uuid::new_v4().to_string();
@@ -505,6 +585,7 @@ pub(super) async fn execute_tool_call(
         id: tc_id.clone(),
         session_id: session_id.map(str::to_string),
         workspace_id: workspace_id.map(str::to_string),
+        turn_id,
         llm_tool_call_id: Some(tc.id.clone()),
         tool_id: tool_id.clone(),
         input_json: tc.function.arguments.clone(),
@@ -513,6 +594,20 @@ pub(super) async fn execute_tool_call(
     })
     .await;
 
+    let proposed_detail = match parsed_args.as_ref() {
+        Ok(_) => serde_json::json!({
+            "llm_tool_call_id": tc.id.as_str(),
+            "risk_level": risk_level.as_deref(),
+            "input": args.clone(),
+        }),
+        Err(error) => serde_json::json!({
+            "llm_tool_call_id": tc.id.as_str(),
+            "risk_level": risk_level.as_deref(),
+            "input": {},
+            "input_parse_error": error,
+            "raw_input_preview": truncate_argument_preview(&tc.function.arguments, 600),
+        }),
+    };
     crate::events::emit_tool_call_lifecycle(
         "tool_call.proposed",
         &tc_id,
@@ -520,13 +615,60 @@ pub(super) async fn execute_tool_call(
         session_id,
         &tool_id,
         "pending",
-        serde_json::json!({
-            "llm_tool_call_id": tc.id.as_str(),
-            "risk_level": risk_level.as_deref(),
-            "input": args,
-        }),
+        proposed_detail.clone(),
     )
     .await;
+    mirror_tool_turn_event(
+        request_id,
+        "tool.call_queued",
+        &tc_id,
+        &tool_id,
+        "pending",
+        proposed_detail,
+    )
+    .await;
+
+    if let Err(error) = parsed_args {
+        let duration_ms = 0;
+        let _ = crate::tool_calls::fail(&tc_id, &error).await;
+        let failed_detail = serde_json::json!({
+            "llm_tool_call_id": tc.id.as_str(),
+            "risk_level": risk_level.as_deref(),
+            "success": false,
+            "duration_ms": duration_ms,
+            "error": error.clone(),
+            "raw_input_preview": truncate_argument_preview(&tc.function.arguments, 600),
+        });
+        crate::events::emit_tool_call_lifecycle(
+            "tool_call.finished",
+            &tc_id,
+            workspace_id,
+            session_id,
+            &tool_id,
+            "failed",
+            failed_detail.clone(),
+        )
+        .await;
+        mirror_tool_turn_event(
+            request_id,
+            "tool.call_failed",
+            &tc_id,
+            &tool_id,
+            "failed",
+            failed_detail,
+        )
+        .await;
+        return (
+            serde_json::json!({
+                "error": error,
+                "raw_input_preview": truncate_argument_preview(&tc.function.arguments, 600),
+            })
+            .to_string(),
+            false,
+            duration_ms,
+            "error",
+        );
+    }
 
     let mut exec_args = args.clone();
     if let Some(obj) = exec_args.as_object_mut() {
@@ -538,10 +680,18 @@ pub(super) async fn execute_tool_call(
             obj.entry("session_id".to_string())
                 .or_insert_with(|| serde_json::json!(session_id));
         }
+        if let Some(workspace_id) = workspace_id {
+            obj.entry("workspace_id".to_string())
+                .or_insert_with(|| serde_json::json!(workspace_id));
+        }
     }
 
     let start = std::time::Instant::now();
     let _ = crate::tool_calls::mark_executing(&tc_id).await;
+    let executing_detail = serde_json::json!({
+        "llm_tool_call_id": tc.id.as_str(),
+        "risk_level": risk_level.as_deref(),
+    });
     crate::events::emit_tool_call_lifecycle(
         "tool_call.executing",
         &tc_id,
@@ -549,10 +699,16 @@ pub(super) async fn execute_tool_call(
         session_id,
         &tool_id,
         "executing",
-        serde_json::json!({
-            "llm_tool_call_id": tc.id.as_str(),
-            "risk_level": risk_level.as_deref(),
-        }),
+        executing_detail.clone(),
+    )
+    .await;
+    mirror_tool_turn_event(
+        request_id,
+        "tool.call_started",
+        &tc_id,
+        &tool_id,
+        "executing",
+        executing_detail,
     )
     .await;
     if let Err(error) =
@@ -561,6 +717,12 @@ pub(super) async fn execute_tool_call(
     {
         let duration_ms = start.elapsed().as_millis() as u64;
         let _ = crate::tool_calls::fail(&tc_id, &error.to_string()).await;
+        let blocked_detail = serde_json::json!({
+            "llm_tool_call_id": tc.id.as_str(),
+            "risk_level": risk_level.as_deref(),
+            "reason": error.to_string(),
+            "duration_ms": duration_ms,
+        });
         crate::events::emit_tool_call_lifecycle(
             "tool_call.blocked",
             &tc_id,
@@ -568,12 +730,16 @@ pub(super) async fn execute_tool_call(
             session_id,
             &tool_id,
             "blocked",
-            serde_json::json!({
-                "llm_tool_call_id": tc.id.as_str(),
-                "risk_level": risk_level.as_deref(),
-                "reason": error.to_string(),
-                "duration_ms": duration_ms,
-            }),
+            blocked_detail.clone(),
+        )
+        .await;
+        mirror_tool_turn_event(
+            request_id,
+            "tool.call_blocked",
+            &tc_id,
+            &tool_id,
+            "blocked",
+            blocked_detail,
         )
         .await;
         return (
@@ -599,11 +765,36 @@ pub(super) async fn execute_tool_call(
             if let Some(ref command_run_id) = command_run_id {
                 let _ = crate::tool_calls::attach_command_run(&tc_id, command_run_id).await;
             }
+            let agent_run_id = match tool_id.as_str() {
+                "agent.start" => result
+                    .output
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string),
+                "subagent.claude_p" => result
+                    .output
+                    .get("agent_run_id")
+                    .or_else(|| result.output.get("id"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string),
+                _ => None,
+            };
+            if let Some(ref agent_run_id) = agent_run_id {
+                let _ = crate::tool_calls::attach_agent_run(&tc_id, agent_run_id).await;
+            }
             let _ = if result.success {
                 crate::tool_calls::complete(&tc_id, &output_str).await
             } else {
                 crate::tool_calls::fail(&tc_id, &output_str).await
             };
+            let finished_detail = serde_json::json!({
+                "llm_tool_call_id": tc.id.as_str(),
+                "risk_level": risk_level.as_deref(),
+                "success": result.success,
+                "duration_ms": duration_ms,
+                "command_run_id": command_run_id,
+                "agent_run_id": agent_run_id,
+            });
             crate::events::emit_tool_call_lifecycle(
                 "tool_call.finished",
                 &tc_id,
@@ -615,13 +806,24 @@ pub(super) async fn execute_tool_call(
                 } else {
                     "failed"
                 },
-                serde_json::json!({
-                    "llm_tool_call_id": tc.id.as_str(),
-                    "risk_level": risk_level.as_deref(),
-                    "success": result.success,
-                    "duration_ms": duration_ms,
-                    "command_run_id": command_run_id,
-                }),
+                finished_detail.clone(),
+            )
+            .await;
+            mirror_tool_turn_event(
+                request_id,
+                if result.success {
+                    "tool.call_succeeded"
+                } else {
+                    "tool.call_failed"
+                },
+                &tc_id,
+                &tool_id,
+                if result.success {
+                    "succeeded"
+                } else {
+                    "failed"
+                },
+                finished_detail,
             )
             .await;
             (
@@ -652,6 +854,14 @@ pub(super) async fn execute_tool_call(
                     &error,
                 )
                 .await;
+                let approval_detail = serde_json::json!({
+                    "llm_tool_call_id": tc.id.as_str(),
+                    "risk_level": risk_level.as_deref(),
+                    "proposal_id": proposal.id.as_str(),
+                    "permission_grant_id": proposal.grant_id.as_deref(),
+                    "reason": "approval_required",
+                    "duration_ms": duration_ms,
+                });
                 crate::events::emit_tool_call_lifecycle(
                     "tool_call.blocked",
                     &tc_id,
@@ -659,14 +869,16 @@ pub(super) async fn execute_tool_call(
                     session_id,
                     &tool_id,
                     "approval_required",
-                    serde_json::json!({
-                        "llm_tool_call_id": tc.id.as_str(),
-                        "risk_level": risk_level.as_deref(),
-                        "proposal_id": proposal.id.as_str(),
-                        "permission_grant_id": proposal.grant_id.as_deref(),
-                        "reason": "approval_required",
-                        "duration_ms": duration_ms,
-                    }),
+                    approval_detail.clone(),
+                )
+                .await;
+                mirror_tool_turn_event(
+                    request_id,
+                    "tool.call_approval_required",
+                    &tc_id,
+                    &tool_id,
+                    "approval_required",
+                    approval_detail,
                 )
                 .await;
                 return (
@@ -699,6 +911,14 @@ pub(super) async fn execute_tool_call(
                     &error,
                 )
                 .await;
+                let approval_detail = serde_json::json!({
+                    "llm_tool_call_id": tc.id.as_str(),
+                    "risk_level": risk_level.as_deref(),
+                    "proposal_id": proposal.id.as_str(),
+                    "permission_grant_id": proposal.grant_id.as_deref(),
+                    "reason": "approval_required",
+                    "duration_ms": duration_ms,
+                });
                 crate::events::emit_tool_call_lifecycle(
                     "tool_call.blocked",
                     &tc_id,
@@ -706,14 +926,16 @@ pub(super) async fn execute_tool_call(
                     session_id,
                     &tool_id,
                     "approval_required",
-                    serde_json::json!({
-                        "llm_tool_call_id": tc.id.as_str(),
-                        "risk_level": risk_level.as_deref(),
-                        "proposal_id": proposal.id.as_str(),
-                        "permission_grant_id": proposal.grant_id.as_deref(),
-                        "reason": "approval_required",
-                        "duration_ms": duration_ms,
-                    }),
+                    approval_detail.clone(),
+                )
+                .await;
+                mirror_tool_turn_event(
+                    request_id,
+                    "tool.call_approval_required",
+                    &tc_id,
+                    &tool_id,
+                    "approval_required",
+                    approval_detail,
                 )
                 .await;
                 return (
@@ -730,6 +952,13 @@ pub(super) async fn execute_tool_call(
             }
 
             let _ = crate::tool_calls::fail(&tc_id, &error).await;
+            let failed_detail = serde_json::json!({
+                "llm_tool_call_id": tc.id.as_str(),
+                "risk_level": risk_level.as_deref(),
+                "success": false,
+                "duration_ms": duration_ms,
+                "error": error.clone(),
+            });
             crate::events::emit_tool_call_lifecycle(
                 "tool_call.finished",
                 &tc_id,
@@ -737,13 +966,16 @@ pub(super) async fn execute_tool_call(
                 session_id,
                 &tool_id,
                 "failed",
-                serde_json::json!({
-                    "llm_tool_call_id": tc.id.as_str(),
-                    "risk_level": risk_level.as_deref(),
-                    "success": false,
-                    "duration_ms": duration_ms,
-                    "error": error,
-                }),
+                failed_detail.clone(),
+            )
+            .await;
+            mirror_tool_turn_event(
+                request_id,
+                "tool.call_failed",
+                &tc_id,
+                &tool_id,
+                "failed",
+                failed_detail,
             )
             .await;
             (
@@ -763,7 +995,7 @@ async fn validate_approved_write_scope(
     workspace_id: Option<&str>,
     approved_write_scope: Option<&[String]>,
 ) -> anyhow::Result<()> {
-    if !matches!(tool_id, "file.write" | "file.edit") {
+    if !matches!(tool_id, "file.write" | "file.append" | "file.edit") {
         return Ok(());
     }
 
@@ -865,6 +1097,7 @@ mod tests {
         let names: Vec<&str> = defs.iter().map(|def| def.function.name.as_str()).collect();
 
         assert!(names.contains(&"agent__start"));
+        assert!(names.contains(&"file__append"));
         assert!(names.iter().any(|name| name.starts_with("agent__team__")));
         assert!(names
             .iter()
@@ -939,8 +1172,21 @@ mod tests {
         let names: Vec<&str> = defs.iter().map(|def| def.function.name.as_str()).collect();
 
         assert!(!names.contains(&"file__write"));
+        assert!(!names.contains(&"file__append"));
         assert!(!names.contains(&"file__edit"));
         assert!(!names.contains(&"bash__execute"));
+    }
+
+    #[test]
+    fn tool_argument_parse_error_preserves_truncated_json_evidence() {
+        let err = parse_tool_call_arguments(
+            r#"{"file_path":"report.md","content":"long report that never closes"#,
+        )
+        .expect_err("truncated JSON should fail explicitly");
+
+        assert!(err.contains("invalid tool arguments JSON"));
+        assert!(err.contains("likely truncated"));
+        assert!(err.contains("file_path"));
     }
 
     #[test]

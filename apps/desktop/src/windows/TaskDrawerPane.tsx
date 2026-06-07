@@ -10,20 +10,23 @@ import {
   type WorkspaceActivityProjection,
 } from '../ipc/invoke';
 import { type DrawerItem, TaskDrawerBody } from './TaskDrawerBody';
+import { LiveDot, type SignalTone } from './PanelKit';
 
 /** A single collapsible drawer row: one-line summary that expands to detail. */
 function DrawerCard({ item, tone }: { item: DrawerItem; tone: 'busy' | 'pending' }) {
+  const signalTone: SignalTone = tone === 'busy' ? 'running' : 'warn';
   return (
-    <article className={`task-card-mini drawer-card drawer-card-${tone}`}>
-      <div className="drawer-card-summary">
-        <span className="drawer-card-caret" />
-        <span className="drawer-card-line">
-          <span className="drawer-card-actor">{item.actor}</span>
-          <span className="drawer-card-title">{item.title}</span>
+    <article className={`task-card-mini drawer-card drawer-card-${tone} deck-drawer-card`}>
+      <div className="drawer-card-summary deck-drawer-card-summary">
+        <LiveDot tone={signalTone} pulse={tone === 'busy'} size={8} />
+        <span className="drawer-card-line deck-drawer-card-body">
+          <span className="drawer-card-actor deck-drawer-card-actor">{item.actor}</span>
+          <span className="drawer-card-title deck-drawer-card-title">{item.title}</span>
         </span>
-        <span className="drawer-card-time">{item.time}</span>
+        <span className="drawer-card-time deck-drawer-card-time">{item.time}</span>
+        <span className="drawer-card-caret deck-drawer-card-caret">›</span>
       </div>
-      <div className="drawer-card-detail" onClick={(e) => e.stopPropagation()}>
+      <div className="drawer-card-detail deck-drawer-card-detail" onClick={(e) => e.stopPropagation()}>
         {item.detail}
       </div>
     </article>

@@ -1,6 +1,6 @@
 use crate::{
     config::CoreConfig,
-    memory::{MemoryScope, RecallResult},
+    memory::{MemoryScope, RecallContext, RecallResult},
     tasks::{self, Task, TaskStatus},
 };
 use chrono::{DateTime, Utc};
@@ -12,6 +12,29 @@ pub(super) async fn build_system_prompt(
     config: &CoreConfig,
     user_message: &str,
     workspace_root_override: Option<&Path>,
+) -> String {
+    build_system_prompt_with_context(
+        tasks,
+        config,
+        user_message,
+        workspace_root_override,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn build_system_prompt_with_context(
+    tasks: &[Task],
+    config: &CoreConfig,
+    user_message: &str,
+    workspace_root_override: Option<&Path>,
+    workspace_id_override: Option<&str>,
+    path_prefix_override: Option<&str>,
+    session_id_override: Option<&str>,
+    goal_id_override: Option<&str>,
 ) -> String {
     let enabled_skills = config
         .persona
@@ -77,8 +100,18 @@ pub(super) async fn build_system_prompt(
         mood_zone.tone_hint(),
     );
 
-    // Memory context: recall_for_prompt gathers entries + summaries in one pass
-    let memory_context = match crate::memory::recall_for_prompt(user_message, None, 5).await {
+    // Memory context: recall_for_prompt_with_context gathers entries + summaries
+    // using the best available turn/workspace scope.
+    let recall_context = RecallContext {
+        query: user_message.to_string(),
+        workspace_id: workspace_id_override.map(str::to_string),
+        path_prefix: path_prefix_override.map(str::to_string),
+        session_id: session_id_override.map(str::to_string),
+        goal_id: goal_id_override.map(str::to_string),
+        limit: 5,
+    };
+    let memory_context = match crate::memory::recall_for_prompt_with_context(&recall_context).await
+    {
         Ok(result) if result.entries.is_empty() && result.summaries.is_empty() => String::new(),
         Ok(result) => build_memory_section(&result, Utc::now()),
         Err(_) => String::new(),
@@ -288,6 +321,7 @@ mod tests {
             category: category.to_string(),
             scope,
             workspace_id: None,
+            path_prefix: None,
             source: MemorySource::UserConfirmed,
             confidence: 1.0,
             sensitivity: MemorySensitivity::Normal,

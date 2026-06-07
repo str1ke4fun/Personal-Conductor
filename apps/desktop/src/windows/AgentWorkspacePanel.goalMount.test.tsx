@@ -89,10 +89,6 @@ vi.mock('./AgentLanes', () => ({
   default: () => <div data-testid="agent-lanes">lanes</div>,
 }));
 
-vi.mock('./OodaTimeline', () => ({
-  default: () => <div data-testid="ooda-timeline">ooda</div>,
-}));
-
 vi.mock('./ReviewQueue', () => ({
   default: () => <div data-testid="review-queue">review</div>,
 }));

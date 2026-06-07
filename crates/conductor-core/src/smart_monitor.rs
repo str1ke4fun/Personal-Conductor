@@ -199,11 +199,29 @@ async fn llm_decide(alert: &PacerAlert, config: &CoreConfig) -> Option<SmartDeci
 
 只返回 JSON，不要有其他文字。"#;
 
-    let request_config = LlmRequestConfig::from_config(&config.llm);
+    let resolved = crate::model_resolver::ModelResolver::resolve(
+        crate::model_resolver::CallerContext::SmartMonitor,
+        None,
+    )
+    .await
+    .unwrap_or_else(|_| crate::model_resolver::ResolvedModel {
+        model_id: config.llm.model.clone(),
+        transport: crate::llm_profiles::TransportKind::HttpApi,
+        profile_id: None,
+        policy_id: None,
+        fallback_used: true,
+        backend_kind: crate::agent_backends::BackendKind::ClaudeP,
+        provider: None,
+        api_base_url: None,
+        api_key: None,
+        temperature: None,
+        max_tokens: None,
+    });
+    let request_config = LlmRequestConfig::from_resolved_with_fallback(&resolved, &config.llm);
     let user_prompt = format!("当前上下文：\n{}", context);
 
     let response = crate::llm::call(
-        &config.llm.model,
+        &resolved.model_id,
         system_prompt,
         &user_prompt,
         &request_config,

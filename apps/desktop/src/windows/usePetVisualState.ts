@@ -1,7 +1,7 @@
 import { listen } from '@tauri-apps/api/event';
 import { useEffect, useRef, useState } from 'react';
 import { api, type AvatarState, type MoodZone, type PetExpressionPayload } from '../ipc/invoke';
-import type { PetState } from '../live2d/stateMap';
+import type { PetState } from './petTypes';
 
 type ActivityVariant =
   | 'idle'

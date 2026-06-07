@@ -154,6 +154,7 @@ async fn main() -> anyhow::Result<()> {
         id: "tc-projection-smoke".to_string(),
         session_id: None,
         workspace_id: Some(workspace.id.clone()),
+        turn_id: None,
         llm_tool_call_id: Some("llm-projection-smoke".to_string()),
         tool_id: "shell.exec".to_string(),
         input_json: r#"{"command":"cargo check"}"#.to_string(),

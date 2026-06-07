@@ -5,6 +5,7 @@
 // Guard: Act can only create Task/Lease/Message/Event, never execute tools directly.
 
 pub mod act;
+pub mod contracts;
 pub mod decide;
 pub mod dispatch;
 pub mod observe;
@@ -185,7 +186,7 @@ impl GoalOrchestrator {
             crate::goals::advance_cycle_phase(&cycle.id, "executing").await?;
             crate::goals::advance_cycle_phase(&cycle.id, "reviewing").await?;
 
-            let review_verdict = self.review(&observe_report)?;
+            let review_verdict = self.review_with_turn(&observe_report).await?;
             return Ok(CycleResult {
                 cycle_id: cycle.id,
                 observe: observe_report,
@@ -198,7 +199,7 @@ impl GoalOrchestrator {
 
         // Review
         crate::goals::advance_cycle_phase(&cycle.id, "reviewing").await?;
-        let review_verdict = self.review(&observe_report)?;
+        let review_verdict = self.review_with_turn(&observe_report).await?;
 
         // Complete or rework cycle
         if review_verdict.accepted {
@@ -267,8 +268,34 @@ impl GoalOrchestrator {
             "dispatching" => {
                 let orient_report = self.orient(&report)?;
                 let budget = budget_for_goal(&report);
-                let mut plan = decide::decide(&orient_report, &budget, &report.goal.objective)?;
+                let mut plan = match decide::decide_llm(
+                    &report,
+                    &orient_report,
+                    &budget,
+                    &report.goal.objective,
+                    goal_id,
+                )
+                .await
+                {
+                    Ok(p) => p,
+                    Err(_) => decide::decide(&orient_report, &budget, &report.goal.objective)?,
+                };
                 apply_plan_approval(&mut plan, &orient_report, self.config.require_plan_approval);
+
+                // ── Debounce: skip re-dispatch when graph state is unchanged ──
+                // Build a lightweight fingerprint from the graph root, facts,
+                // open intents, and active hints in the observe snapshot.
+                // If the hash matches what was stored at the end of the previous
+                // dispatching pass, there is nothing new to act on yet.
+                let current_hash = compute_observe_hash(&report);
+                if let Some(ref cycle) = report.current_cycle {
+                    if cycle.last_graph_hash.as_deref() == Some(current_hash.as_str()) {
+                        // Graph unchanged — park until something moves.
+                        return Ok(());
+                    }
+                    // Persist the new hash so the next tick can compare.
+                    let _ = crate::goals::set_cycle_hash(&cycle.id, &current_hash).await;
+                }
 
                 // If plan approval is required and not yet given, park in awaiting state.
                 if self.config.require_plan_approval {
@@ -297,9 +324,63 @@ impl GoalOrchestrator {
                     crate::goals::update_goal_status(goal_id, "running").await?;
                 }
 
+                // S1: Persist DispatchPlan before act() so review can reconstruct decisions.
+                let tasks_json = serde_json::to_string(&plan.tasks).unwrap_or_default();
+                let plan_summary = format!("{} task(s)", plan.tasks.len());
+                let _ = crate::goals::create_dispatch_plan(
+                    goal_id,
+                    &cycle.id,
+                    &tasks_json,
+                    &plan_summary,
+                )
+                .await;
+
+                // S5: Apply dispatch governance — parallel limits, dependency scheduling,
+                // write-scope conflict detection, failure loop protection.
+                let active_agents: Vec<dispatch::ActiveAgent> = orient_report
+                    .agent_fit
+                    .iter()
+                    .filter(|a| !a.is_available)
+                    .map(|a| dispatch::ActiveAgent {
+                        agent_id: a.agent_id.clone(),
+                        task_id: String::new(),
+                        write_scope: vec![],
+                    })
+                    .collect();
+                let completed_task_ids: Vec<String> = report
+                    .active_tasks
+                    .iter()
+                    .filter(|t| matches!(t.status.as_str(), "completed" | "accepted"))
+                    .map(|t| t.id.clone())
+                    .collect();
+                let dispatch_result = dispatch::filter_dispatch(
+                    plan.tasks.clone(),
+                    &active_agents,
+                    &completed_task_ids,
+                    &[],
+                    &dispatch::DispatchConfig::default(),
+                );
+                let approved_tasks = dispatch_result.approved;
+                if approved_tasks.is_empty() && !plan.tasks.is_empty() {
+                    // All tasks held/rejected — park until state changes.
+                    return Ok(());
+                }
+                let filtered_plan = decide::DispatchPlan {
+                    tasks: approved_tasks,
+                    write_scope: plan.write_scope.clone(),
+                    acceptance: plan.acceptance.clone(),
+                    budget_remaining: plan.budget_remaining.clone(),
+                    approved: plan.approved,
+                };
+
                 crate::goals::advance_cycle_phase(&cycle.id, "executing").await?;
-                self.act(goal_id, &cycle.id, &report.goal.workspace_id, &plan)
-                    .await?;
+                self.act(
+                    goal_id,
+                    &cycle.id,
+                    &report.goal.workspace_id,
+                    &filtered_plan,
+                )
+                .await?;
             }
             "executing" => {
                 self.tick_executing(goal_id, &cycle.id).await?;
@@ -350,6 +431,12 @@ impl GoalOrchestrator {
     /// Review: collect verdicts from the current cycle.
     pub fn review(&self, report: &ObserveReport) -> Result<ReviewVerdict> {
         review::review(report)
+    }
+
+    /// Review with ChatTurn anchor: same as [`review`] but also resolves the
+    /// `chat_turn_request_id` by looking up the ChatTurn for the current cycle.
+    pub async fn review_with_turn(&self, report: &ObserveReport) -> Result<ReviewVerdict> {
+        review::review_with_turn(report).await
     }
 
     async fn tick_executing(&self, goal_id: &str, cycle_id: &str) -> Result<()> {
@@ -444,6 +531,71 @@ impl GoalOrchestrator {
 
         Ok(())
     }
+}
+
+/// Build a cheap fingerprint of the graph state used for dispatching debounce.
+/// Hashes goal root + facts + open intents + active hints using FNV-1a.
+/// FNV-1a accumulator — no crypto dependency needed.
+fn compute_observe_hash(report: &ObserveReport) -> String {
+    const FNV_OFFSET: u64 = 14695981039346656037;
+    const FNV_PRIME: u64 = 1099511628211;
+
+    let mut hash: u64 = FNV_OFFSET;
+    let mut feed = |s: &str| {
+        for b in s.bytes() {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        // separator
+        hash ^= 0xFF;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    };
+
+    feed("goal");
+    feed(&report.goal.id);
+    feed(&report.goal.objective);
+
+    let mut facts: Vec<_> = report.facts.iter().collect();
+    facts.sort_by(|a, b| a.id.cmp(&b.id));
+    for fact in facts {
+        feed("fact");
+        feed(&fact.id);
+        feed(&fact.key);
+        feed(&fact.category);
+        feed(&fact.value);
+        feed(&fact.updated_at);
+    }
+
+    let mut intents: Vec<_> = report
+        .active_tasks
+        .iter()
+        .filter(|task| matches!(task.status.as_str(), "proposed" | "queued" | "claimed"))
+        .collect();
+    intents.sort_by(|a, b| a.id.cmp(&b.id));
+    for intent in intents {
+        feed("intent");
+        feed(&intent.id);
+        feed(&intent.status);
+        feed(&intent.title);
+        feed(&intent.instruction);
+        feed(&intent.updated_at.to_rfc3339());
+    }
+
+    let mut hints: Vec<_> = report
+        .recent_hints
+        .iter()
+        .filter(|hint| hint.status == "active")
+        .collect();
+    hints.sort_by(|a, b| a.id.cmp(&b.id));
+    for hint in hints {
+        feed("hint");
+        feed(&hint.id);
+        feed(&hint.kind);
+        feed(&hint.content);
+        feed(&hint.updated_at.to_rfc3339());
+    }
+
+    format!("{hash:016x}")
 }
 
 fn budget_for_goal(report: &ObserveReport) -> Budget {
@@ -596,6 +748,9 @@ pub async fn apply_goal_review_verdict(goal_id: &str, accepted: bool) -> Result<
         .current_cycle_id
         .clone()
         .ok_or_else(|| anyhow::anyhow!("goal {goal_id} has no active cycle"))?;
+    let report = observe::observe(goal_id).await?;
+    let current_hash = compute_observe_hash(&report);
+    let _ = crate::goals::set_cycle_hash(&cycle_id, &current_hash).await;
     crate::goals::advance_cycle_phase(&cycle_id, "summarizing").await?;
     crate::goals::advance_cycle_phase(&cycle_id, "completed").await?;
     let team_id = format!("team-{cycle_id}");

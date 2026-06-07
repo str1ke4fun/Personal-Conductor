@@ -1,8 +1,9 @@
 use super::db;
-use super::types::{ChatMessage, ToolCallRecord};
+use super::types::{ChatMessage, ChatMessageV2, ChatRole, ContentBlock, ToolCallRecord};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 #[cfg(feature = "tauri-events")]
@@ -466,6 +467,65 @@ pub async fn get_chat_session_messages(
     rows.into_iter().map(db::message_from_row).collect()
 }
 
+/// Get a session timeline through the projection read model when available.
+///
+/// Projections override the legacy row for the same message id, while older legacy
+/// rows without projections are still preserved so mixed sessions remain readable
+/// during migration.
+pub async fn get_chat_session_messages_v2(
+    session_id: &str,
+    limit: Option<u32>,
+) -> anyhow::Result<Vec<ChatMessageV2>> {
+    let fetch_limit = limit.map(|value| value.clamp(1, 500)).or(Some(500));
+    let projections =
+        super::turns::list_message_projections_by_session(session_id, fetch_limit).await?;
+    let legacy_messages = get_chat_session_messages(session_id, fetch_limit).await?;
+
+    if projections.is_empty() {
+        let mut fallback: Vec<ChatMessageV2> = legacy_messages
+            .into_iter()
+            .map(|message| message.to_v2())
+            .collect();
+        apply_v2_limit(&mut fallback, limit);
+        return Ok(fallback);
+    }
+
+    let mut projected_by_id = HashMap::new();
+    let mut projection_only = Vec::new();
+    for projection in projections {
+        let message = projection_to_message_v2(projection)?;
+        let identity = message.id.clone();
+        if legacy_messages.iter().any(|legacy| legacy.id == identity) {
+            projected_by_id.insert(identity, message);
+        } else {
+            projection_only.push(message);
+        }
+    }
+
+    let mut merged = Vec::new();
+    for legacy in legacy_messages {
+        if let Some(mut projected) = projected_by_id.remove(&legacy.id) {
+            projected.created_at = legacy.created_at.clone();
+            projected.seq = legacy.seq;
+            merged.push(projected);
+        } else {
+            merged.push(legacy.to_v2());
+        }
+    }
+    merged.extend(projected_by_id.into_values());
+    merged.extend(projection_only);
+    merged.sort_by(|left, right| {
+        left.seq
+            .cmp(&right.seq)
+            .then_with(|| left.created_at.cmp(&right.created_at))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    merged.dedup_by(|left, right| left.id == right.id);
+    apply_v2_limit(&mut merged, limit);
+
+    Ok(merged)
+}
+
 /// Rename a chat session.
 pub async fn rename_chat_session(session_id: &str, title: &str) -> anyhow::Result<()> {
     let pool = crate::db::pool().await?;
@@ -481,6 +541,37 @@ pub async fn rename_chat_session(session_id: &str, title: &str) -> anyhow::Resul
         .await?;
 
     Ok(())
+}
+
+fn projection_to_message_v2(
+    projection: super::turns::MessageProjectionRecord,
+) -> anyhow::Result<ChatMessageV2> {
+    let role = ChatRole::from_db(&projection.role)?;
+    let content_blocks: Vec<ContentBlock> =
+        serde_json::from_value(projection.content_blocks_json).unwrap_or_default();
+
+    Ok(ChatMessageV2 {
+        id: projection
+            .message_id
+            .clone()
+            .unwrap_or_else(|| projection.id.clone()),
+        role,
+        content_blocks,
+        created_at: projection.created_at,
+        seq: projection.seq,
+    })
+}
+
+fn apply_v2_limit(messages: &mut Vec<ChatMessageV2>, limit: Option<u32>) {
+    let Some(limit) = limit else {
+        return;
+    };
+    let limit = usize::try_from(limit.clamp(1, 500)).unwrap_or(500);
+    if messages.len() <= limit {
+        return;
+    }
+    let keep_from = messages.len() - limit;
+    messages.drain(0..keep_from);
 }
 
 pub async fn update_chat_session_workspace(
@@ -586,7 +677,7 @@ pub(super) async fn auto_title_session(session_id: &str, first_message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{chat::db, chat::types::ChatRole, test_support::TestRoot};
+    use crate::{chat::db, chat::turns, chat::types::ChatRole, test_support::TestRoot};
 
     #[tokio::test]
     async fn list_chat_sessions_hides_internal_goal_exec_sessions() {
@@ -638,5 +729,207 @@ mod tests {
         assert_eq!(history[0].role, ChatRole::User);
         assert_eq!(history[1].id, assistant.id);
         assert_eq!(history[1].seq, history[0].seq + 1);
+    }
+
+    #[tokio::test]
+    async fn get_chat_session_messages_v2_prefers_projection_read_model() {
+        let _root = TestRoot::new();
+        let session = create_chat_session(Some("Projected Timeline".to_string()), None)
+            .await
+            .expect("create session");
+        let pool = crate::db::pool().await.expect("db pool");
+
+        let user_message = db::insert_message_with_session(
+            &pool,
+            ChatRole::User,
+            "legacy user".to_string(),
+            None,
+            Some(&session.id),
+        )
+        .await
+        .expect("insert user message");
+        let assistant_message = db::insert_message_with_session(
+            &pool,
+            ChatRole::Assistant,
+            "legacy assistant".to_string(),
+            None,
+            Some(&session.id),
+        )
+        .await
+        .expect("insert assistant message");
+
+        turns::create_turn(turns::ChatTurnCreate {
+            session_id: Some(session.id.clone()),
+            projection_session_id: Some(session.id.clone()),
+            workspace_id: None,
+            request_id: "req-session-v2".to_string(),
+            initiator_kind: "user".to_string(),
+            task_mode: "short".to_string(),
+            capability: "ask_write".to_string(),
+            model_provider: None,
+            model_name: None,
+            metadata_json: serde_json::json!({}),
+            goal_cycle_id: None,
+            agent_task_id: None,
+            goal_id: None,
+        })
+        .await
+        .expect("create turn");
+        turns::attach_user_message_by_request("req-session-v2", &user_message.id)
+            .await
+            .expect("attach user");
+        turns::attach_assistant_message_by_request("req-session-v2", &assistant_message.id)
+            .await
+            .expect("attach assistant");
+        turns::create_message_projection(turns::MessageProjectionCreate {
+            request_id: "req-session-v2".to_string(),
+            message_id: Some(user_message.id.clone()),
+            role: "user".to_string(),
+            projection_kind: "user_input".to_string(),
+            status: "visible".to_string(),
+            visibility: "visible".to_string(),
+            plain_text: Some("projected user".to_string()),
+            content_blocks_json: serde_json::json!([{ "type": "text", "text": "projected user" }]),
+            source_event_id: None,
+        })
+        .await
+        .expect("create user projection");
+        turns::create_message_projection(turns::MessageProjectionCreate {
+            request_id: "req-session-v2".to_string(),
+            message_id: Some(assistant_message.id.clone()),
+            role: "assistant".to_string(),
+            projection_kind: "assistant_final".to_string(),
+            status: "finalized".to_string(),
+            visibility: "visible".to_string(),
+            plain_text: Some("projected assistant".to_string()),
+            content_blocks_json: serde_json::json!([{ "type": "text", "text": "projected assistant" }]),
+            source_event_id: None,
+        })
+        .await
+        .expect("create assistant projection");
+
+        let messages = get_chat_session_messages_v2(&session.id, Some(10))
+            .await
+            .expect("get v2 messages");
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, ChatRole::User);
+        assert_eq!(messages[1].role, ChatRole::Assistant);
+        assert_eq!(messages[0].id, user_message.id);
+        assert_eq!(messages[1].id, assistant_message.id);
+        assert!(matches!(
+            &messages[1].content_blocks[0],
+            ContentBlock::Text { text } if text == "projected assistant"
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_chat_session_messages_v2_merges_legacy_history_with_projected_turns() {
+        let _root = TestRoot::new();
+        let session = create_chat_session(Some("Mixed Timeline".to_string()), None)
+            .await
+            .expect("create session");
+        let pool = crate::db::pool().await.expect("db pool");
+
+        let old_user = db::insert_message_with_session(
+            &pool,
+            ChatRole::User,
+            "old user".to_string(),
+            None,
+            Some(&session.id),
+        )
+        .await
+        .expect("insert old user");
+        let old_assistant = db::insert_message_with_session(
+            &pool,
+            ChatRole::Assistant,
+            "old assistant".to_string(),
+            None,
+            Some(&session.id),
+        )
+        .await
+        .expect("insert old assistant");
+        let new_user = db::insert_message_with_session(
+            &pool,
+            ChatRole::User,
+            "new legacy user".to_string(),
+            None,
+            Some(&session.id),
+        )
+        .await
+        .expect("insert new user");
+        let new_assistant = db::insert_message_with_session(
+            &pool,
+            ChatRole::Assistant,
+            "new legacy assistant".to_string(),
+            None,
+            Some(&session.id),
+        )
+        .await
+        .expect("insert new assistant");
+
+        turns::create_turn(turns::ChatTurnCreate {
+            session_id: Some(session.id.clone()),
+            projection_session_id: Some(session.id.clone()),
+            workspace_id: None,
+            request_id: "req-session-mixed".to_string(),
+            initiator_kind: "user".to_string(),
+            task_mode: "short".to_string(),
+            capability: "ask_write".to_string(),
+            model_provider: None,
+            model_name: None,
+            metadata_json: serde_json::json!({}),
+            goal_cycle_id: None,
+            agent_task_id: None,
+            goal_id: None,
+        })
+        .await
+        .expect("create turn");
+        turns::attach_user_message_by_request("req-session-mixed", &new_user.id)
+            .await
+            .expect("attach new user");
+        turns::attach_assistant_message_by_request("req-session-mixed", &new_assistant.id)
+            .await
+            .expect("attach new assistant");
+        turns::create_message_projection(turns::MessageProjectionCreate {
+            request_id: "req-session-mixed".to_string(),
+            message_id: Some(new_user.id.clone()),
+            role: "user".to_string(),
+            projection_kind: "user_input".to_string(),
+            status: "visible".to_string(),
+            visibility: "visible".to_string(),
+            plain_text: Some("projected new user".to_string()),
+            content_blocks_json: serde_json::json!([{ "type": "text", "text": "projected new user" }]),
+            source_event_id: None,
+        })
+        .await
+        .expect("create new user projection");
+        turns::create_message_projection(turns::MessageProjectionCreate {
+            request_id: "req-session-mixed".to_string(),
+            message_id: Some(new_assistant.id.clone()),
+            role: "assistant".to_string(),
+            projection_kind: "assistant_final".to_string(),
+            status: "finalized".to_string(),
+            visibility: "visible".to_string(),
+            plain_text: Some("projected new assistant".to_string()),
+            content_blocks_json: serde_json::json!([{ "type": "text", "text": "projected new assistant" }]),
+            source_event_id: None,
+        })
+        .await
+        .expect("create new assistant projection");
+
+        let messages = get_chat_session_messages_v2(&session.id, None)
+            .await
+            .expect("get mixed v2 messages");
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].id, old_user.id);
+        assert_eq!(messages[1].id, old_assistant.id);
+        assert_eq!(messages[2].id, new_user.id);
+        assert_eq!(messages[3].id, new_assistant.id);
+        assert!(matches!(
+            &messages[3].content_blocks[0],
+            ContentBlock::Text { text } if text == "projected new assistant"
+        ));
     }
 }

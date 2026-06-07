@@ -27,6 +27,7 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
   'file.grep': '搜索内容',
   'file.read': '读取文件',
   'file.write': '写入文件',
+  'file.append': '追加文件',
   'file.edit': '编辑文件',
   'file.stat': '文件信息',
   'workspace.current': '查看工作区',
@@ -42,6 +43,7 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
 const PROMINENT_TOOLS = new Set([
   'bash.execute',
   'file.write',
+  'file.append',
   'file.edit',
   'codex.start',
   'agent.start',

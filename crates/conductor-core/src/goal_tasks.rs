@@ -576,6 +576,7 @@ pub async fn set_task_result_ref_review_ready(
         result.rows_affected() == 1,
         "task {task_id} was not moved to review_ready; expected running task writeback"
     );
+    let _ = crate::events::emit_goal_task_result_projected(task_id, result_ref, None, None).await;
     Ok(())
 }
 
@@ -602,6 +603,7 @@ pub async fn set_task_result_ref_blocked(
         result.rows_affected() == 1,
         "task {task_id} was not moved to blocked; expected running task writeback"
     );
+    let _ = crate::events::emit_goal_task_writeback_failed(task_id, reason, None).await;
     Ok(())
 }
 

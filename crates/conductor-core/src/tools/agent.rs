@@ -1,11 +1,14 @@
 use crate::proposals::RiskLevel;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use super::registry::{
     ToolExecutionResult, ToolPermission, ToolProviderKind, ToolRegistry, ToolSpec,
 };
 use super::shared_runtime;
+
+const DEFAULT_SUBAGENT_TIMEOUT_SECONDS: u64 = 600;
+const MIN_SUBAGENT_TIMEOUT_SECONDS: u64 = 300;
+const MAX_SUBAGENT_TIMEOUT_SECONDS: u64 = 3600;
 
 fn execute_subagent_claude_p(
     _spec: &ToolSpec,
@@ -23,26 +26,82 @@ fn execute_subagent_claude_p(
     let timeout_seconds = input
         .get("timeout_seconds")
         .and_then(|v| v.as_u64())
-        .unwrap_or(300)
-        .clamp(1, 3600);
+        .unwrap_or(DEFAULT_SUBAGENT_TIMEOUT_SECONDS)
+        .clamp(MIN_SUBAGENT_TIMEOUT_SECONDS, MAX_SUBAGENT_TIMEOUT_SECONDS);
+    let workspace_id = input
+        .get("workspace_id")
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    let session_id = input
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    let tool_call_id = input
+        .get("tool_call_id")
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    let task_id = input
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    let team_id = input
+        .get("team_id")
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    let agent_member_id = input
+        .get("agent_member_id")
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
 
     let runtime = shared_runtime();
-    let result = runtime.block_on(crate::subagent::run_claude_p(
-        prompt,
-        cwd.as_deref(),
-        Duration::from_secs(timeout_seconds),
+    let run = runtime.block_on(crate::agent_runs::start_claude_run(
+        crate::agent_runs::StartAgentRunInput {
+            agent_id: input
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("claude")
+                .to_string(),
+            role: input
+                .get("role")
+                .and_then(|v| v.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("subagent")
+                .to_string(),
+            workspace_id,
+            cwd,
+            prompt: prompt.to_string(),
+            timeout_seconds,
+            metadata: Some(serde_json::json!({
+                "source": "subagent.claude_p",
+                "session_id": session_id,
+                "tool_call_id": tool_call_id,
+                "task_id": task_id,
+                "team_id": team_id,
+                "agent_id": agent_member_id,
+            })),
+        },
     ))?;
 
     Ok(ToolExecutionResult {
-        success: result.exit_code == Some(0) && !result.timed_out,
+        success: true,
         output: serde_json::json!({
-            "agent_run_id": result.agent_run_id,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "exit_code": result.exit_code,
-            "duration_ms": result.duration_ms,
-            "log_path": result.log_path.map(|path| path.display().to_string()),
-            "timed_out": result.timed_out,
+            "agent_run_id": run.id.clone(),
+            "run": run,
+            "stdout": "",
+            "stderr": "",
+            "exit_code": null,
+            "duration_ms": 0,
+            "log_path": null,
+            "timed_out": false,
+            "status": "running",
+            "message": "started background claude -p run; use agent.read_output with agent_run_id to read results"
         }),
         error: None,
         duration_ms: 0,
@@ -293,14 +352,20 @@ pub(super) fn register(registry: &mut ToolRegistry) {
         ToolSpec {
             id: "subagent.claude_p".to_string(),
             name: "运行 Claude 子 Agent".to_string(),
-            description: "通过 claude -p 在指定工作目录运行后台子 Agent".to_string(),
+            description: "通过 claude -p 在指定工作目录启动后台子 Agent，立即返回 agent_run_id；用 agent.read_output 读取结果".to_string(),
             provider: ToolProviderKind::Subagent,
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "prompt": { "type": "string" },
                     "cwd": { "type": "string" },
-                    "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 3600 }
+                    "agent_id": { "type": "string" },
+                    "role": { "type": "string" },
+                    "workspace_id": { "type": "string" },
+                    "timeout_seconds": { "type": "integer", "minimum": 300, "maximum": 3600, "default": 600 },
+                    "task_id": { "type": "string", "description": "goal_tasks.id to write result_ref back on completion" },
+                    "team_id": { "type": "string", "description": "agent_teams.id for team lifecycle tracking" },
+                    "agent_member_id": { "type": "string", "description": "agent_teams member agent_id for status updates" }
                 },
                 "required": ["prompt"]
             }),
@@ -308,12 +373,15 @@ pub(super) fn register(registry: &mut ToolRegistry) {
                 "type": "object",
                 "properties": {
                     "agent_run_id": { "type": ["string", "null"] },
+                    "run": { "type": "object" },
+                    "status": { "type": "string" },
                     "stdout": { "type": "string" },
                     "stderr": { "type": "string" },
                     "exit_code": { "type": ["integer", "null"] },
                     "duration_ms": { "type": "integer" },
                     "log_path": { "type": ["string", "null"] },
-                    "timed_out": { "type": "boolean" }
+                    "timed_out": { "type": "boolean" },
+                    "message": { "type": "string" }
                 }
             }),
             risk_level: RiskLevel::ExternalSideEffect,

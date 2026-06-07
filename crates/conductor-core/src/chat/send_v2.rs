@@ -1,12 +1,13 @@
 use super::{
     active_run, db,
-    prompt::build_system_prompt,
+    prompt::build_system_prompt_with_context,
     session::{auto_title_session, resolve_session_workspace},
     tools::{
         build_tool_definitions, build_tool_definitions_for_catalog_selection,
         build_tool_definitions_with_allowed_ids, execute_tool_call,
         should_use_progressive_tool_discovery, tool_id_from_llm_name, tool_name_for_llm,
     },
+    turns,
     types::{
         CapabilityRequest, ChatCapability, ChatMessage, ChatReply, ChatRole, ChatTaskMode,
         ContentBlock, GoalSeed, StreamChatTokenEvent, ThinkingUpdateEvent, ToolCallRecord,
@@ -14,7 +15,7 @@ use super::{
     },
     util::{
         append_chat_stage, build_content_blocks_for_db, chat_elapsed_ms, generate_bubble_summary,
-        plain_text_for_llm, spawn_chat_stage, update_post_chat_avatar,
+        plain_text_for_llm, spawn_chat_stage, update_post_chat_avatar, user_visible_plain_text,
     },
 };
 use crate::{
@@ -39,6 +40,8 @@ lazy_static::lazy_static! {
     /// Tracks sessions that have already been auto-summarized (idempotency guard).
     static ref SUMMARIZED_SESSIONS: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
 }
+
+const FINAL_ANSWER_MAX_TOKENS: u32 = 8_000;
 
 /// Compute simple keyword overlap between two texts (Jaccard-like).
 /// Returns a value in [0.0, 1.0]; lower means more different topics.
@@ -182,12 +185,14 @@ const PLAN_ONLY_SYSTEM_INSTRUCTION: &str = concat!(
 
 const TOOL_COMPLETION_SYSTEM_INSTRUCTION: &str = concat!(
     "If you use tools, you must still end with a direct user-facing answer. ",
-    "Do not stop at tool traces alone. Summarize what you found, what changed, the concrete outputs or artifacts, and any remaining blockers."
+    "Do not stop at tool traces alone. Summarize what you found, what changed, the concrete outputs or artifacts, and any remaining blockers. ",
+    "When writing long reports or files, keep each tool call argument small: create or overwrite the file with file.write, then append additional chunks with file.append."
 );
 
 const LONG_TASK_SYSTEM_INSTRUCTION: &str = concat!(
     "You are in long-task/goal mode. Continue across multiple tool rounds when needed, ",
-    "but only stop once you can provide a concrete, reviewable result or an explicit blocker."
+    "but only stop once you can provide a concrete, reviewable result or an explicit blocker. ",
+    "When writing long reports or files, keep each tool call argument small: create or overwrite the file with file.write, then append additional chunks with file.append."
 );
 
 fn execution_mode_system_instruction(task_mode: ChatTaskMode) -> &'static str {
@@ -245,14 +250,246 @@ fn snapshot_timeout_recovery(
         .unwrap_or_default()
 }
 
+async fn persist_final_turn_artifacts(
+    request_id: &str,
+    assistant: &ChatMessage,
+    projection_kind: &str,
+    plain_text: &str,
+    scope_kind: &str,
+    scope_ref: Option<String>,
+    path_prefix: Option<String>,
+    tool_call_ids: &[String],
+    tool_records: &[ToolCallRecord],
+) -> anyhow::Result<()> {
+    turns::attach_assistant_message_by_request(request_id, &assistant.id).await?;
+
+    let projection = turns::create_message_projection(turns::MessageProjectionCreate {
+        request_id: request_id.to_string(),
+        message_id: Some(assistant.id.clone()),
+        role: "assistant".to_string(),
+        projection_kind: projection_kind.to_string(),
+        status: "finalized".to_string(),
+        visibility: "visible".to_string(),
+        plain_text: Some(plain_text.to_string()),
+        content_blocks_json: serde_json::to_value(assistant.to_v2().content_blocks.clone())?,
+        source_event_id: None,
+    })
+    .await?;
+
+    let summary = if plain_text.trim().is_empty() {
+        "assistant final answer".to_string()
+    } else {
+        plain_text.chars().take(500).collect()
+    };
+    let source_tool_call_id = tool_call_ids.first().cloned();
+    let assistant_message_id = assistant.id.clone();
+    let projection_id = projection.id.clone();
+    let evidence_json = serde_json::json!({
+        "request_id": request_id,
+        "assistant_message_id": assistant_message_id,
+        "projection_id": projection_id,
+        "tool_call_ids": tool_call_ids,
+        "tool_records": tool_records.len(),
+        "projection_kind": projection_kind,
+    });
+    let value_json = serde_json::json!({
+        "summary": summary.clone(),
+        "plain_text": plain_text,
+        "tool_call_ids": tool_call_ids,
+        "tool_records": tool_records,
+    });
+
+    // Only emit a memory candidate when there is substantive content to remember.
+    if !plain_text.trim().is_empty() || !tool_call_ids.is_empty() {
+        let _ = turns::create_memory_candidate(turns::MemoryCandidateCreate {
+            request_id: request_id.to_string(),
+            source_message_id: Some(assistant.id.clone()),
+            source_projection_id: Some(projection.id.clone()),
+            source_tool_call_id,
+            memory_kind: "assistant_final_answer".to_string(),
+            scope_kind: scope_kind.to_string(),
+            scope_ref,
+            path_prefix,
+            key: format!("turn:{request_id}:assistant_final_answer"),
+            value_json,
+            summary,
+            evidence_json,
+            extractor_kind: "rule".to_string(),
+            extractor_provider: None,
+            extractor_model: None,
+            confidence: 0.4,
+            status: "proposed".to_string(),
+            dedupe_key: format!("turn:{request_id}:assistant_final_answer:{projection_kind}"),
+        })
+        .await?;
+    }
+
+    Ok(())
+}
+
+fn truncate_chars_with_suffix(text: &str, max_chars: usize) -> String {
+    const SUFFIX: &str = "...(truncated)";
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(SUFFIX.chars().count());
+    let mut truncated: String = text.chars().take(keep).collect();
+    truncated.push_str(SUFFIX);
+    truncated
+}
+
+fn extract_reviewable_json_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => {
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        serde_json::Value::Array(items) => {
+            let parts = items
+                .iter()
+                .filter_map(extract_reviewable_json_text)
+                .take(3)
+                .collect::<Vec<_>>();
+            (!parts.is_empty()).then(|| parts.join("\n\n"))
+        }
+        serde_json::Value::Object(map) => {
+            for key in [
+                "summary", "text", "stdout", "message", "content", "result", "diff", "stderr",
+            ] {
+                if let Some(text) = map.get(key).and_then(extract_reviewable_json_text) {
+                    return Some(text);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn reviewable_result_text(result: &str) -> String {
+    let trimmed = result.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(text) = extract_reviewable_json_text(&value) {
+            return text;
+        }
+    }
+    trimmed.to_string()
+}
+
 fn compact_result_excerpt(result: &str, max_chars: usize) -> String {
-    result
+    let flattened = reviewable_result_text(result)
         .split_whitespace()
         .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(max_chars)
-        .collect()
+        .join(" ");
+    truncate_chars_with_suffix(&flattened, max_chars)
+}
+
+fn compact_argument_excerpt(arguments: &str, max_chars: usize) -> String {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let normalized = serde_json::from_str::<serde_json::Value>(trimmed)
+        .ok()
+        .and_then(|value| serde_json::to_string(&value).ok())
+        .unwrap_or_else(|| trimmed.to_string());
+    truncate_chars_with_suffix(&normalized, max_chars)
+}
+
+fn build_final_answer_recovery_prompt(
+    user_request: &str,
+    previous_text: &str,
+    tool_records: &[ToolCallRecord],
+) -> String {
+    let mut prompt = format!("User request:\n{}\n\n", user_request.trim());
+    let previous = previous_text.trim();
+    if !previous.is_empty() {
+        prompt.push_str("Last visible draft (may be incomplete):\n");
+        prompt.push_str(previous);
+        prompt.push_str("\n\n");
+    }
+    let success_count = tool_records.iter().filter(|record| record.success).count();
+    let failed_count = tool_records.len().saturating_sub(success_count);
+    let write_artifacts = tool_records
+        .iter()
+        .filter(|record| {
+            record.success
+                && matches!(
+                    record.tool_name.as_str(),
+                    "file.write" | "file.append" | "file.edit"
+                )
+        })
+        .filter_map(|record| {
+            serde_json::from_str::<serde_json::Value>(&record.result)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("path")
+                        .or_else(|| value.get("absolute_path"))
+                        .and_then(|path| path.as_str())
+                        .map(|path| path.to_string())
+                })
+        })
+        .collect::<Vec<_>>();
+    prompt.push_str(&format!(
+        "Tool status summary: total {}, succeeded {}, failed {}.\n",
+        tool_records.len(),
+        success_count,
+        failed_count
+    ));
+    if write_artifacts.is_empty() {
+        prompt.push_str("Verified written artifacts: none.\n\n");
+    } else {
+        prompt.push_str("Verified written artifacts:\n");
+        for artifact in write_artifacts {
+            prompt.push_str(&format!("- {artifact}\n"));
+        }
+        prompt.push('\n');
+    }
+    prompt.push_str("Verified tool results:\n");
+    let recent_records = tool_records.iter().rev().take(12).collect::<Vec<_>>();
+    if recent_records.is_empty() {
+        prompt.push_str("- No tool results were captured.\n");
+    } else {
+        let omitted_count = tool_records.len().saturating_sub(recent_records.len());
+        for (display_index, record) in recent_records.into_iter().rev().enumerate() {
+            prompt.push_str(&format!(
+                "Tool {}: {} ({})\n",
+                display_index + 1,
+                record.tool_name,
+                if record.success {
+                    "succeeded"
+                } else {
+                    "failed"
+                }
+            ));
+            let input = compact_argument_excerpt(&record.arguments, 220);
+            if !input.is_empty() && input != "{}" {
+                prompt.push_str(&format!("Input: {input}\n"));
+            }
+            let excerpt = truncate_chars_with_suffix(&reviewable_result_text(&record.result), 1200);
+            if !excerpt.is_empty() {
+                prompt.push_str("Result:\n");
+                prompt.push_str(&excerpt);
+                prompt.push_str("\n\n");
+            } else if !record.success {
+                prompt.push_str("Result:\n(tool failed without captured output)\n\n");
+            }
+        }
+        if omitted_count > 0 {
+            prompt.push_str(&format!(
+                "Additional earlier tool results omitted: {omitted_count}\n"
+            ));
+        }
+    }
+    prompt.push_str(
+        "\nWrite the final answer the user should see. Be concrete about findings, changes, artifacts, and blockers. Do not ask to call more tools. Do not claim files or artifacts were written unless they are listed under verified written artifacts.",
+    );
+    prompt
 }
 
 fn synthesize_reviewable_fallback(
@@ -293,7 +530,7 @@ fn synthesize_reviewable_fallback(
         lines.push(format!("最近工具：{}", last_record.tool_name));
         lines.push(format!(
             "结果摘录：{}",
-            compact_result_excerpt(&last_record.result, 420)
+            compact_result_excerpt(&last_record.result, 1200)
         ));
     } else if !previous.is_empty() {
         lines.push(format!("上一条可见说明：{}", previous));
@@ -336,6 +573,110 @@ fn build_error_reviewable_message(recovery: &TimeoutRecoveryState, error: &str) 
     )
 }
 
+async fn recover_error_reply_text(
+    app_handle: &tauri::AppHandle,
+    event_session_id: Option<String>,
+    request_id: &str,
+    started: std::time::Instant,
+    request_config: &LlmRequestConfig<'_>,
+    model: &str,
+    user_request: &str,
+    recovery: &TimeoutRecoveryState,
+    turn: usize,
+    error: &str,
+) -> String {
+    match recover_final_answer_from_tool_results(
+        app_handle,
+        event_session_id,
+        request_id,
+        started,
+        request_config,
+        model,
+        user_request,
+        &recovery.final_text,
+        &recovery.tool_records,
+        turn,
+    )
+    .await
+    {
+        Ok(Some(text)) => text,
+        Ok(None) => build_error_reviewable_message(recovery, error),
+        Err(recovery_err) => {
+            append_chat_stage(
+                request_id,
+                "final_answer_recovery_failed",
+                started,
+                serde_json::json!({
+                    "turn": turn,
+                    "error": format!("{recovery_err:#}"),
+                    "recovery_context": "outer_error_handler",
+                }),
+            )
+            .await;
+            build_error_reviewable_message(recovery, error)
+        }
+    }
+}
+
+async fn recover_timeout_reply_text(
+    app_handle: &tauri::AppHandle,
+    event_session_id: Option<String>,
+    request_id: &str,
+    started: std::time::Instant,
+    request_config: &LlmRequestConfig<'_>,
+    model: &str,
+    user_request: &str,
+    recovery: &TimeoutRecoveryState,
+    turn: usize,
+    overall_timeout: Duration,
+) -> String {
+    match recover_final_answer_from_tool_results(
+        app_handle,
+        event_session_id,
+        request_id,
+        started,
+        request_config,
+        model,
+        user_request,
+        &recovery.final_text,
+        &recovery.tool_records,
+        turn,
+    )
+    .await
+    {
+        Ok(Some(text)) => text,
+        Ok(None) => build_timeout_reviewable_message(recovery, overall_timeout),
+        Err(recovery_err) => {
+            append_chat_stage(
+                request_id,
+                "final_answer_recovery_failed",
+                started,
+                serde_json::json!({
+                    "turn": turn,
+                    "error": format!("{recovery_err:#}"),
+                    "recovery_context": "outer_timeout_handler",
+                }),
+            )
+            .await;
+            build_timeout_reviewable_message(recovery, overall_timeout)
+        }
+    }
+}
+
+async fn fail_incomplete_tool_calls_for_request(request_id: &str, error: &str) -> u64 {
+    let Some(turn) = turns::find_turn_by_request_id(request_id)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return 0;
+    };
+
+    crate::tool_calls::fail_incomplete_for_turn(&turn.id, error)
+        .await
+        .unwrap_or(0)
+}
+
 async fn force_final_answer(
     app_handle: &tauri::AppHandle,
     event_session_id: Option<String>,
@@ -367,6 +708,7 @@ async fn force_final_answer(
         serde_json::json!({
             "turn": turn,
             "messages": messages.len(),
+            "max_tokens": FINAL_ANSWER_MAX_TOKENS,
         }),
     )
     .await;
@@ -382,9 +724,14 @@ async fn force_final_answer(
     let mut final_request_config = request_config.clone();
     final_request_config.tool_choice = None;
 
-    let response =
-        llm::call_with_tools_with_messages(model, &final_messages, &final_request_config, None)
-            .await?;
+    let response = llm::call_with_tools_with_messages_max_tokens(
+        model,
+        &final_messages,
+        &final_request_config,
+        None,
+        FINAL_ANSWER_MAX_TOKENS,
+    )
+    .await?;
     let final_text = response
         .content
         .map(|text| text.trim().to_string())
@@ -393,6 +740,81 @@ async fn force_final_answer(
     append_chat_stage(
         request_id,
         "final_answer_retry_done",
+        started,
+        serde_json::json!({
+            "turn": turn,
+            "text_chars": final_text.as_ref().map(|text| text.chars().count()).unwrap_or(0),
+        }),
+    )
+    .await;
+
+    Ok(final_text)
+}
+
+async fn recover_final_answer_from_tool_results(
+    app_handle: &tauri::AppHandle,
+    event_session_id: Option<String>,
+    request_id: &str,
+    started: std::time::Instant,
+    request_config: &LlmRequestConfig<'_>,
+    model: &str,
+    user_request: &str,
+    previous_text: &str,
+    tool_records: &[ToolCallRecord],
+    turn: usize,
+) -> anyhow::Result<Option<String>> {
+    const FINAL_ANSWER_RECOVERY_SYSTEM_INSTRUCTION: &str = concat!(
+        "You are recovering a final user-facing answer after a tool-execution turn. ",
+        "Use only the verified tool results in the prompt. ",
+        "Do not call more tools. ",
+        "Return a direct answer for the user, including concrete findings, changes, artifacts, and blockers if the work is incomplete. ",
+        "Never claim files were written unless the prompt lists verified written artifacts."
+    );
+
+    if tool_records.is_empty() {
+        return Ok(None);
+    }
+
+    if let Some(ref sid) = event_session_id {
+        active_run::update_active_phase(sid, request_id, Some("recovering_answer".to_string()));
+    }
+    let _ = app_handle.emit(
+        "thinking-update",
+        ThinkingUpdateEvent {
+            session_id: event_session_id.clone(),
+            request_id: request_id.to_string(),
+            phase: "recovering_answer".to_string(),
+            message: "正在根据工具结果恢复最终答复...".to_string(),
+            turn: turn as i32,
+            timestamp: Utc::now().to_rfc3339(),
+        },
+    );
+    append_chat_stage(
+        request_id,
+        "final_answer_recovery_start",
+        started,
+        serde_json::json!({
+            "turn": turn,
+            "tool_records": tool_records.len(),
+            "max_tokens": FINAL_ANSWER_MAX_TOKENS,
+        }),
+    )
+    .await;
+
+    let prompt = build_final_answer_recovery_prompt(user_request, previous_text, tool_records);
+    let text = llm::call_with_max_tokens(
+        model,
+        FINAL_ANSWER_RECOVERY_SYSTEM_INSTRUCTION,
+        &prompt,
+        request_config,
+        FINAL_ANSWER_MAX_TOKENS,
+    )
+    .await?;
+    let final_text = (!text.trim().is_empty()).then(|| text.trim().to_string());
+
+    append_chat_stage(
+        request_id,
+        "final_answer_recovery_done",
         started,
         serde_json::json!({
             "turn": turn,
@@ -531,6 +953,14 @@ pub async fn send_message_v2_with_session(
     .await
 }
 
+/// Optional goal/task context for chat turns created by the goal task executor. (P0-A)
+#[derive(Debug, Clone, Default)]
+pub struct ChatExecutionContext {
+    pub goal_id: Option<String>,
+    pub goal_cycle_id: Option<String>,
+    pub agent_task_id: Option<String>,
+}
+
 pub async fn send_message_v2_with_session_projection(
     content: String,
     app_handle: &tauri::AppHandle,
@@ -542,6 +972,35 @@ pub async fn send_message_v2_with_session_projection(
     approved_write_scope: Option<Vec<String>>,
     allowed_tool_ids_override: Option<Vec<String>>,
     request_id_override: Option<String>,
+) -> anyhow::Result<ChatReply> {
+    send_message_v2_with_session_projection_ctx(
+        content,
+        app_handle,
+        session_id,
+        projection_session_id,
+        task_mode,
+        capability,
+        plan_only,
+        approved_write_scope,
+        allowed_tool_ids_override,
+        request_id_override,
+        None,
+    )
+    .await
+}
+
+pub async fn send_message_v2_with_session_projection_ctx(
+    content: String,
+    app_handle: &tauri::AppHandle,
+    session_id: Option<String>,
+    projection_session_id: Option<String>,
+    task_mode: ChatTaskMode,
+    capability: ChatCapability,
+    plan_only: bool,
+    approved_write_scope: Option<Vec<String>>,
+    allowed_tool_ids_override: Option<Vec<String>>,
+    request_id_override: Option<String>,
+    execution_context: Option<ChatExecutionContext>,
 ) -> anyhow::Result<ChatReply> {
     let content = content.trim().to_string();
     if content.is_empty() {
@@ -555,6 +1014,76 @@ pub async fn send_message_v2_with_session_projection(
     let started = std::time::Instant::now();
     let event_session_id = projection_session_id.clone().or_else(|| session_id.clone());
     let timeout_recovery = Arc::new(Mutex::new(TimeoutRecoveryState::default()));
+    let original_user_request = content.clone();
+    let turn_workspace =
+        resolve_session_workspace(session_id.as_deref().or(event_session_id.as_deref()))
+            .await
+            .ok()
+            .flatten();
+    let config_snapshot = config::load().await.ok();
+    let resolved_model = crate::model_resolver::ModelResolver::resolve_with_context(
+        crate::model_resolver::CallerContext::ChatMainLoop,
+        None,
+        Some(&request_id),
+        None,
+        turn_workspace.as_ref().map(|ws| ws.id.as_str()),
+    )
+    .await
+    .unwrap_or_else(|_| crate::model_resolver::ResolvedModel {
+        model_id: config_snapshot
+            .as_ref()
+            .map(|cfg| cfg.llm.model.clone())
+            .unwrap_or_else(|| "gpt-4.1-mini".to_string()),
+        transport: crate::llm_profiles::TransportKind::HttpApi,
+        profile_id: None,
+        policy_id: None,
+        fallback_used: true,
+        backend_kind: crate::agent_backends::BackendKind::ClaudeP,
+        provider: config_snapshot
+            .as_ref()
+            .map(|cfg| cfg.llm.provider.as_str().to_string()),
+        api_base_url: None,
+        api_key: None,
+        temperature: None,
+        max_tokens: None,
+    });
+    let turn_metadata = serde_json::json!({
+        "plan_only": plan_only,
+        "has_projection_session": projection_session_id.is_some(),
+        "allowed_tool_ids_override_count": allowed_tool_ids_override.as_ref().map(|items| items.len()).unwrap_or(0),
+    });
+    let _turn = turns::create_turn(turns::ChatTurnCreate {
+        session_id: session_id.clone(),
+        projection_session_id: projection_session_id.clone(),
+        workspace_id: turn_workspace.as_ref().map(|ws| ws.id.clone()),
+        request_id: request_id.clone(),
+        initiator_kind: if session_id.is_some() {
+            "chat".to_string()
+        } else {
+            "direct".to_string()
+        },
+        task_mode: task_mode.as_str().to_string(),
+        capability: capability.as_str().to_string(),
+        model_provider: resolved_model
+            .provider
+            .as_deref()
+            .map(|p| p.to_string())
+            .or_else(|| {
+                config_snapshot
+                    .as_ref()
+                    .map(|cfg| cfg.llm.provider.as_str().to_string())
+            }),
+        model_name: Some(resolved_model.model_id.clone()),
+        metadata_json: turn_metadata,
+        goal_cycle_id: execution_context
+            .as_ref()
+            .and_then(|c| c.goal_cycle_id.clone()),
+        agent_task_id: execution_context
+            .as_ref()
+            .and_then(|c| c.agent_task_id.clone()),
+        goal_id: execution_context.as_ref().and_then(|c| c.goal_id.clone()),
+    })
+    .await?;
     let is_projected_execution = match (projection_session_id.as_deref(), session_id.as_deref()) {
         (Some(projection_session_id), Some(session_id)) => projection_session_id != session_id,
         (Some(_), None) => true,
@@ -592,6 +1121,7 @@ pub async fn send_message_v2_with_session_projection(
             approved_write_scope,
             allowed_tool_ids_override,
             timeout_recovery.clone(),
+            resolved_model.clone(),
         ),
     )
     .await
@@ -614,12 +1144,33 @@ pub async fn send_message_v2_with_session_projection(
             if let Some(ref sid) = event_session_id {
                 active_run::remove_active_run(sid, &request_id);
             }
+            let abandoned_tool_calls = fail_incomplete_tool_calls_for_request(
+                &request_id,
+                "turn failed before tool execution completed",
+            )
+            .await;
             let error_recovery_snapshot = snapshot_timeout_recovery(&timeout_recovery);
             if !error_recovery_snapshot.final_text.trim().is_empty()
                 || !error_recovery_snapshot.tool_records.is_empty()
             {
-                let recovery_reply_text =
-                    build_error_reviewable_message(&error_recovery_snapshot, &format!("{err:#}"));
+                let config = config::load()
+                    .await
+                    .unwrap_or_else(|_| config::CoreConfig::default());
+                let request_config =
+                    LlmRequestConfig::from_resolved_with_fallback(&resolved_model, &config.llm);
+                let recovery_reply_text = recover_error_reply_text(
+                    app_handle,
+                    event_session_id.clone(),
+                    &request_id,
+                    started,
+                    &request_config,
+                    &resolved_model.model_id,
+                    &original_user_request,
+                    &error_recovery_snapshot,
+                    max_turns_for_mode(task_mode),
+                    &format!("{err:#}"),
+                )
+                .await;
                 append_chat_stage(
                     &request_id,
                     "failed_recovered",
@@ -629,12 +1180,38 @@ pub async fn send_message_v2_with_session_projection(
                         "tool_records": error_recovery_snapshot.tool_records.len(),
                         "final_text_chars": error_recovery_snapshot.final_text.chars().count(),
                         "projected_execution": is_projected_execution,
+                        "abandoned_tool_calls": abandoned_tool_calls,
                     }),
                 )
                 .await;
                 let recovery_msg =
                     db::store_timeout_reply_with_text(session_id.as_deref(), &recovery_reply_text)
                         .await?;
+                let recovery_plain_text = user_visible_plain_text(&recovery_msg.content);
+                let recovery_scope_kind = if turn_workspace.is_some() {
+                    "workspace"
+                } else if session_id.is_some() {
+                    "session"
+                } else {
+                    "global"
+                };
+                let recovery_scope_ref = turn_workspace.as_ref().map(|ws| ws.id.clone());
+                let recovery_path_prefix = turn_workspace
+                    .as_ref()
+                    .map(|ws| ws.root.to_string_lossy().to_string());
+                let recovery_tool_call_ids: Vec<String> = Vec::new();
+                persist_final_turn_artifacts(
+                    &request_id,
+                    &recovery_msg,
+                    "assistant_recovery",
+                    &recovery_plain_text,
+                    recovery_scope_kind,
+                    recovery_scope_ref,
+                    recovery_path_prefix,
+                    &recovery_tool_call_ids,
+                    &error_recovery_snapshot.tool_records,
+                )
+                .await?;
                 let history_limit = config::load()
                     .await
                     .unwrap_or_else(|_| config::CoreConfig::default())
@@ -686,7 +1263,10 @@ pub async fn send_message_v2_with_session_projection(
                 &request_id,
                 "failed",
                 started,
-                serde_json::json!({ "error": format!("{err:#}") }),
+                serde_json::json!({
+                    "error": format!("{err:#}"),
+                    "abandoned_tool_calls": abandoned_tool_calls,
+                }),
             )
             .await;
             let _ = app_handle.emit(
@@ -703,9 +1283,30 @@ pub async fn send_message_v2_with_session_projection(
             if let Some(ref sid) = event_session_id {
                 active_run::remove_active_run(sid, &request_id);
             }
+            let abandoned_tool_calls = fail_incomplete_tool_calls_for_request(
+                &request_id,
+                "turn timed out before tool execution completed",
+            )
+            .await;
             let timeout_recovery_snapshot = snapshot_timeout_recovery(&timeout_recovery);
-            let timeout_reply_text =
-                build_timeout_reviewable_message(&timeout_recovery_snapshot, overall_timeout);
+            let config = config::load()
+                .await
+                .unwrap_or_else(|_| config::CoreConfig::default());
+            let request_config =
+                LlmRequestConfig::from_resolved_with_fallback(&resolved_model, &config.llm);
+            let timeout_reply_text = recover_timeout_reply_text(
+                app_handle,
+                event_session_id.clone(),
+                &request_id,
+                started,
+                &request_config,
+                &resolved_model.model_id,
+                &original_user_request,
+                &timeout_recovery_snapshot,
+                max_turns_for_mode(task_mode),
+                overall_timeout,
+            )
+            .await;
             append_chat_stage(
                 &request_id,
                 "timeout",
@@ -715,12 +1316,38 @@ pub async fn send_message_v2_with_session_projection(
                     "tool_records": timeout_recovery_snapshot.tool_records.len(),
                     "final_text_chars": timeout_recovery_snapshot.final_text.chars().count(),
                     "projected_execution": is_projected_execution,
+                    "abandoned_tool_calls": abandoned_tool_calls,
                 }),
             )
             .await;
             let timeout_msg =
                 db::store_timeout_reply_with_text(session_id.as_deref(), &timeout_reply_text)
                     .await?;
+            let timeout_plain_text = user_visible_plain_text(&timeout_msg.content);
+            let timeout_scope_kind = if turn_workspace.is_some() {
+                "workspace"
+            } else if session_id.is_some() {
+                "session"
+            } else {
+                "global"
+            };
+            let timeout_scope_ref = turn_workspace.as_ref().map(|ws| ws.id.clone());
+            let timeout_path_prefix = turn_workspace
+                .as_ref()
+                .map(|ws| ws.root.to_string_lossy().to_string());
+            let timeout_tool_call_ids: Vec<String> = Vec::new();
+            persist_final_turn_artifacts(
+                &request_id,
+                &timeout_msg,
+                "assistant_timeout",
+                &timeout_plain_text,
+                timeout_scope_kind,
+                timeout_scope_ref,
+                timeout_path_prefix,
+                &timeout_tool_call_ids,
+                &timeout_recovery_snapshot.tool_records,
+            )
+            .await?;
             let history_limit = config::load()
                 .await
                 .unwrap_or_else(|_| config::CoreConfig::default())
@@ -780,6 +1407,7 @@ async fn send_message_v2_inner(
     approved_write_scope: Option<Vec<String>>,
     allowed_tool_ids_override: Option<Vec<String>>,
     timeout_recovery: Arc<Mutex<TimeoutRecoveryState>>,
+    resolved_model: crate::model_resolver::ResolvedModel,
 ) -> anyhow::Result<ChatReply> {
     let _ = expression::init_db().await;
     let _ = affection::init_db().await;
@@ -794,13 +1422,28 @@ async fn send_message_v2_inner(
     crate::tools::register_builtin_tools();
     let pool = crate::db::pool().await?;
     append_chat_stage(&request_id, "db_pool_ready", started, serde_json::json!({})).await;
-    db::insert_message_with_session(
+    let user_message = db::insert_message_with_session(
         &pool,
         ChatRole::User,
         content.clone(),
         None,
         session_id.as_deref(),
     )
+    .await?;
+
+    turns::attach_user_message_by_request(&request_id, &user_message.id).await?;
+    let user_blocks = user_message.to_v2().content_blocks;
+    let user_projection = turns::create_message_projection(turns::MessageProjectionCreate {
+        request_id: request_id.clone(),
+        message_id: Some(user_message.id.clone()),
+        role: "user".to_string(),
+        projection_kind: "user_input".to_string(),
+        status: "visible".to_string(),
+        visibility: "visible".to_string(),
+        plain_text: Some(content.clone()),
+        content_blocks_json: serde_json::to_value(user_blocks)?,
+        source_event_id: None,
+    })
     .await?;
 
     // Auto-title session from first user message
@@ -811,7 +1454,10 @@ async fn send_message_v2_inner(
         &request_id,
         "user_message_stored",
         started,
-        serde_json::json!({}),
+        serde_json::json!({
+            "message_id": user_message.id.as_str(),
+            "projection_id": user_projection.id.as_str(),
+        }),
     )
     .await;
 
@@ -835,8 +1481,13 @@ async fn send_message_v2_inner(
         "context_loaded",
         started,
         serde_json::json!({
-            "provider": config.llm.provider.as_str(),
-            "model": config.llm.model.as_str(),
+            "resolved_model": {
+                "model_id": resolved_model.model_id,
+                "provider": resolved_model.provider,
+                "profile_id": resolved_model.profile_id,
+                "policy_id": resolved_model.policy_id,
+                "fallback_used": resolved_model.fallback_used,
+            },
             "tasks": snapshot.tasks.len(),
             "history": recent_history.len(),
             "session_id": session_id.as_deref(),
@@ -884,16 +1535,18 @@ async fn send_message_v2_inner(
 
     // If the session is already a goal session, skip the upgrade gate —
     // the user is chatting within an active goal, not requesting to create one.
-    let session_is_goal = if let Some(ref sid) = session_id {
+    let execution_session_summary = if let Some(ref sid) = session_id {
         crate::chat::session::get_chat_session(sid)
             .await
             .ok()
             .flatten()
-            .map(|s| s.session_kind == "goal")
-            .unwrap_or(false)
     } else {
-        false
+        None
     };
+    let session_is_goal = execution_session_summary
+        .as_ref()
+        .map(|s| s.session_kind == "goal")
+        .unwrap_or(false);
 
     if !session_is_goal && should_offer_goal_upgrade(&content, task_mode, plan_only) {
         append_chat_stage(
@@ -917,11 +1570,34 @@ async fn send_message_v2_inner(
     }
 
     // Build messages for LLM
-    let system = build_system_prompt(
+    let recall_path_prefix = session_workspace
+        .as_ref()
+        .map(|ws| ws.root.to_string_lossy().to_string());
+    let projection_goal_id = match event_session_id.as_deref() {
+        Some(event_sid) if session_id.as_deref() != Some(event_sid) => {
+            crate::chat::session::get_chat_session(event_sid)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|session| session.goal_id)
+        }
+        _ => None,
+    };
+    let recall_goal_id = projection_goal_id.or_else(|| {
+        execution_session_summary
+            .as_ref()
+            .and_then(|s| s.goal_id.clone())
+    });
+    let recall_session_id = session_id.as_deref().or(event_session_id.as_deref());
+    let system = build_system_prompt_with_context(
         &snapshot.tasks,
         &config,
         &content,
         session_workspace.as_ref().map(|ws| ws.root.as_path()),
+        session_workspace.as_ref().map(|ws| ws.id.as_str()),
+        recall_path_prefix.as_deref(),
+        recall_session_id,
+        recall_goal_id.as_deref(),
     )
     .await;
     let mut tool_defs = if let Some(allowed_tool_ids_override) = allowed_tool_ids_override
@@ -1012,7 +1688,8 @@ async fn send_message_v2_inner(
         });
     }
 
-    let request_config = LlmRequestConfig::from_config(&config.llm);
+    let request_config =
+        LlmRequestConfig::from_resolved_with_fallback(&resolved_model, &config.llm);
     let mut all_tool_records: Vec<ToolCallRecord> = Vec::new();
     let mut all_tool_call_ids: Vec<String> = Vec::new();
     let mut all_reasoning_content: Vec<String> = Vec::new();
@@ -1061,18 +1738,26 @@ async fn send_message_v2_inner(
             started,
             serde_json::json!({
                 "turn": _turn,
-                "provider": config.llm.provider.as_str(),
-                "model": config.llm.model.as_str(),
+                "resolved_model": {
+                    "model_id": resolved_model.model_id,
+                    "provider": resolved_model.provider,
+                    "profile_id": resolved_model.profile_id,
+                    "policy_id": resolved_model.policy_id,
+                    "fallback_used": resolved_model.fallback_used,
+                },
                 "messages": messages.len(),
                 "tool_defs": tool_defs.len(),
             }),
         )
         .await;
+        let _ =
+            turns::update_turn_counts_by_request(&request_id, Some((_turn + 1) as i64), None, None)
+                .await;
         let llm_started = std::time::Instant::now();
         let mut first_text_token_logged = false;
         let stream_request_id = request_id.clone();
         let response_result = llm::call_with_tools_with_messages_streaming(
-            &config.llm.model,
+            &resolved_model.model_id,
             &messages,
             &request_config,
             if tool_defs.is_empty() {
@@ -1279,6 +1964,13 @@ async fn send_message_v2_inner(
                     active_tool_count,
                 );
             }
+            let _ = turns::update_turn_counts_by_request(
+                &request_id,
+                None,
+                Some(tool_run_count as i64),
+                Some(active_tool_count as i64),
+            )
+            .await;
             append_chat_stage(
                 &request_id,
                 "tool_start",
@@ -1295,6 +1987,7 @@ async fn send_message_v2_inner(
                 session_id.as_deref(),
                 session_workspace.as_ref().map(|ws| ws.id.as_str()),
                 approved_write_scope.as_deref(),
+                Some(&request_id),
                 app_handle,
             )
             .await;
@@ -1341,6 +2034,13 @@ async fn send_message_v2_inner(
                     active_tool_count,
                 );
             }
+            let _ = turns::update_turn_counts_by_request(
+                &request_id,
+                None,
+                Some(tool_run_count as i64),
+                Some(active_tool_count as i64),
+            )
+            .await;
             // Emit tool completion event with duration_ms
             let _ = app_handle.emit(
                 "tool-execution-update",
@@ -1488,7 +2188,7 @@ async fn send_message_v2_inner(
             &request_id,
             started,
             &request_config,
-            &config.llm.model,
+            &resolved_model.model_id,
             &messages,
             max_turns,
         )
@@ -1510,6 +2210,42 @@ async fn send_message_v2_inner(
                 append_chat_stage(
                     &request_id,
                     "final_answer_retry_failed",
+                    started,
+                    serde_json::json!({
+                        "turn": max_turns,
+                        "error": format!("{err:#}"),
+                    }),
+                )
+                .await;
+            }
+        }
+    }
+
+    if !completed_with_final_answer && !all_tool_records.is_empty() {
+        match recover_final_answer_from_tool_results(
+            app_handle,
+            event_session_id.clone(),
+            &request_id,
+            started,
+            &request_config,
+            &resolved_model.model_id,
+            &content,
+            &final_content,
+            &all_tool_records,
+            max_turns,
+        )
+        .await
+        {
+            Ok(Some(text)) => {
+                final_content = text;
+                set_timeout_recovery_text(&timeout_recovery, &final_content);
+                completed_with_final_answer = true;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                append_chat_stage(
+                    &request_id,
+                    "final_answer_recovery_failed",
                     started,
                     serde_json::json!({
                         "turn": max_turns,
@@ -1577,6 +2313,30 @@ async fn send_message_v2_inner(
         content_for_db,
         tool_calls_json,
         session_id.as_deref(),
+    )
+    .await?;
+    let assistant_plain_text = user_visible_plain_text(&assistant.content);
+    let scope_kind = if session_workspace.is_some() {
+        "workspace"
+    } else if session_id.is_some() {
+        "session"
+    } else {
+        "global"
+    };
+    let scope_ref = session_workspace.as_ref().map(|ws| ws.id.clone());
+    let path_prefix = session_workspace
+        .as_ref()
+        .map(|ws| ws.root.to_string_lossy().to_string());
+    persist_final_turn_artifacts(
+        &request_id,
+        &assistant,
+        "assistant_final",
+        &assistant_plain_text,
+        scope_kind,
+        scope_ref,
+        path_prefix,
+        &all_tool_call_ids,
+        &all_tool_records,
     )
     .await?;
     let history = if let Some(ref sid) = session_id {
@@ -1779,6 +2539,72 @@ mod tests {
         assert!(message.contains("120s"));
         assert!(message.contains("Partial result"));
         assert!(message.contains("Partial rollout summary"));
+    }
+
+    #[test]
+    fn compact_result_excerpt_prefers_structured_text_and_marks_truncation() {
+        let excerpt = compact_result_excerpt(
+            &serde_json::json!({
+                "text": "A".repeat(1400),
+                "path": "docs/spec.md"
+            })
+            .to_string(),
+            120,
+        );
+
+        assert!(excerpt.starts_with(&"A".repeat(40)));
+        assert!(excerpt.ends_with("...(truncated)"));
+    }
+
+    #[test]
+    fn final_answer_recovery_prompt_includes_user_request_and_tool_digest() {
+        let prompt = build_final_answer_recovery_prompt(
+            "Review the repository and explain the risks.",
+            "",
+            &[ToolCallRecord {
+                tool_name: "file.read".to_string(),
+                arguments: r#"{"file_path":"docs/spec.md"}"#.to_string(),
+                result: serde_json::json!({
+                    "text": "Security finding summary"
+                })
+                .to_string(),
+                success: true,
+            }],
+        );
+
+        assert!(prompt.contains("User request"));
+        assert!(prompt.contains("Review the repository"));
+        assert!(prompt.contains("Tool 1: file.read"));
+        assert!(prompt.contains("Security finding summary"));
+    }
+
+    #[test]
+    fn final_answer_recovery_prompt_includes_failed_tools_and_artifact_guard() {
+        let prompt = build_final_answer_recovery_prompt(
+            "Review the repository and write the summary.",
+            "",
+            &[
+                ToolCallRecord {
+                    tool_name: "file.read".to_string(),
+                    arguments: r#"{"file_path":"missing.md"}"#.to_string(),
+                    result: "file not found: missing.md; did you mean .claude/skills/x/missing.md?"
+                        .to_string(),
+                    success: false,
+                },
+                ToolCallRecord {
+                    tool_name: "file.read".to_string(),
+                    arguments: r#"{"file_path":"docs/spec.md"}"#.to_string(),
+                    result: serde_json::json!({ "text": "Review finding" }).to_string(),
+                    success: true,
+                },
+            ],
+        );
+
+        assert!(prompt.contains("failed 1"));
+        assert!(prompt.contains("Verified written artifacts: none"));
+        assert!(prompt.contains("Tool 1: file.read (failed)"));
+        assert!(prompt.contains("did you mean .claude/skills"));
+        assert!(prompt.contains("Do not claim files or artifacts were written"));
     }
 
     #[test]

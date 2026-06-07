@@ -99,6 +99,36 @@ impl RuntimeApiServer {
                 get(get_cycle_handler),
             )
             .route(
+                "/runtime/goals/{goal_id}/graph",
+                get(get_goal_graph_handler),
+            )
+            .route(
+                "/runtime/goals/{goal_id}/hints",
+                get(list_hints_handler).post(create_hint_handler),
+            )
+            .route(
+                "/runtime/goals/{goal_id}/hints/{hint_id}",
+                axum::routing::delete(dismiss_hint_handler),
+            )
+            .route(
+                "/runtime/llm-profiles",
+                get(list_llm_profiles_handler).post(create_llm_profile_handler),
+            )
+            .route(
+                "/runtime/llm-profiles/{profile_id}",
+                get(get_llm_profile_handler)
+                    .put(update_llm_profile_handler)
+                    .delete(delete_llm_profile_handler),
+            )
+            .route(
+                "/runtime/routing-policies",
+                get(list_routing_policies_handler).post(create_routing_policy_handler),
+            )
+            .route(
+                "/runtime/routing-policies/{policy_id}",
+                axum::routing::delete(delete_routing_policy_handler),
+            )
+            .route(
                 "/runtime/permission-requests",
                 post(request_permission_handler),
             )
@@ -316,6 +346,53 @@ struct PermissionScopeBody {
 #[derive(Deserialize)]
 struct ApprovePermissionBody {
     mode: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CreateHintBody {
+    content: String,
+    hint_kind: Option<String>,
+    priority: Option<i64>,
+    cycle_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CreateLlmProfileBody {
+    name: String,
+    provider: String,
+    model_id: String,
+    api_base_url: String,
+    api_key_encrypted: Option<String>,
+    max_tokens: Option<i64>,
+    temperature: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct UpdateLlmProfileBody {
+    name: Option<String>,
+    provider: Option<String>,
+    model_id: Option<String>,
+    api_base_url: Option<String>,
+    api_key_encrypted: Option<String>,
+    max_tokens: Option<i64>,
+    temperature: Option<f64>,
+    enabled: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct ListLlmProfilesQuery {
+    enabled_only: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct CreateRoutingPolicyBody {
+    work_kind: String,
+    caller_phase: Option<String>,
+    backend_kind: String,
+    profile_id: Option<String>,
+    priority: Option<i64>,
+    enabled: Option<bool>,
+    reason_template: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -736,6 +813,61 @@ async fn get_cycle_handler(
 }
 
 // ---------------------------------------------------------------------------
+// Goal hint handlers
+// ---------------------------------------------------------------------------
+
+async fn create_hint_handler(
+    Path(goal_id): Path<String>,
+    Json(body): Json<CreateHintBody>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    let kind = body.hint_kind.as_deref().unwrap_or("user");
+    let hint = crate::goal_hints::create_hint(
+        &goal_id,
+        body.cycle_id.as_deref(),
+        kind,
+        &body.content,
+        None,
+    )
+    .await
+    .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+
+    Ok((StatusCode::CREATED, Json(json!(hint))))
+}
+
+async fn list_hints_handler(
+    Path(goal_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let hints = crate::goal_hints::list_active_hints(&goal_id, None)
+        .await
+        .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+
+    Ok(Json(json!(hints)))
+}
+
+async fn dismiss_hint_handler(
+    Path((goal_id, hint_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    // Verify the hint exists and belongs to this goal before dismissing.
+    let hint = crate::goal_hints::get_hint(&hint_id)
+        .await
+        .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .ok_or_else(|| json_error(StatusCode::NOT_FOUND, &format!("hint not found: {hint_id}")))?;
+
+    if hint.goal_id != goal_id {
+        return Err(json_error(
+            StatusCode::NOT_FOUND,
+            &format!("hint {hint_id} does not belong to goal {goal_id}"),
+        ));
+    }
+
+    crate::goal_hints::dismiss_hint(&hint_id)
+        .await
+        .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+
+    Ok(Json(json!({ "dismissed": true, "hint_id": hint_id })))
+}
+
+// ---------------------------------------------------------------------------
 // Permission handlers
 // ---------------------------------------------------------------------------
 
@@ -843,6 +975,162 @@ async fn deny_permission_handler(
 }
 
 // ---------------------------------------------------------------------------
+// LlmProfile handlers
+// ---------------------------------------------------------------------------
+
+async fn list_llm_profiles_handler(
+    Query(q): Query<ListLlmProfilesQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let profiles = crate::llm_profiles::list_profiles(q.enabled_only.unwrap_or(false))
+        .await
+        .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    Ok(Json(serde_json::json!(profiles)))
+}
+
+async fn create_llm_profile_handler(
+    Json(body): Json<CreateLlmProfileBody>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    let profile = crate::llm_profiles::create_profile(
+        &body.name,
+        &body.provider,
+        &body.model_id,
+        &body.api_base_url,
+        body.api_key_encrypted.as_deref(),
+        body.max_tokens.unwrap_or(4096),
+        body.temperature.unwrap_or(0.7),
+    )
+    .await
+    .map_err(|e| json_error(StatusCode::BAD_REQUEST, &e.to_string()))?;
+    Ok((StatusCode::CREATED, Json(serde_json::json!(profile))))
+}
+
+async fn get_llm_profile_handler(
+    Path(profile_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let profile = crate::llm_profiles::get_profile(&profile_id)
+        .await
+        .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .ok_or_else(|| {
+            json_error(
+                StatusCode::NOT_FOUND,
+                &format!("llm profile not found: {profile_id}"),
+            )
+        })?;
+    Ok(Json(serde_json::json!(profile)))
+}
+
+async fn update_llm_profile_handler(
+    Path(profile_id): Path<String>,
+    Json(body): Json<UpdateLlmProfileBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let api_key_update = body.api_key_encrypted.as_ref().map(|v| Some(v.as_str()));
+    let profile = crate::llm_profiles::update_profile(
+        &profile_id,
+        body.name.as_deref(),
+        body.provider.as_deref(),
+        body.model_id.as_deref(),
+        body.api_base_url.as_deref(),
+        api_key_update,
+        body.max_tokens,
+        body.temperature,
+        body.enabled,
+    )
+    .await
+    .map_err(|e| {
+        let msg = e.to_string();
+        if msg.contains("not found") {
+            json_error(StatusCode::NOT_FOUND, &msg)
+        } else {
+            json_error(StatusCode::BAD_REQUEST, &msg)
+        }
+    })?;
+    Ok(Json(serde_json::json!(profile)))
+}
+
+async fn delete_llm_profile_handler(
+    Path(profile_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    crate::llm_profiles::delete_profile(&profile_id)
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("not found") {
+                json_error(StatusCode::NOT_FOUND, &msg)
+            } else {
+                json_error(StatusCode::INTERNAL_SERVER_ERROR, &msg)
+            }
+        })?;
+    Ok(Json(
+        serde_json::json!({ "deleted": true, "profile_id": profile_id }),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Routing policy handlers
+// ---------------------------------------------------------------------------
+
+async fn list_routing_policies_handler(
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let policies = crate::routing::list_policies(crate::routing::RoutingPolicyFilter::default())
+        .await
+        .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    Ok(Json(serde_json::json!(policies)))
+}
+
+async fn create_routing_policy_handler(
+    Json(body): Json<CreateRoutingPolicyBody>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    let work_kind = crate::routing::WorkKind::from_str(&body.work_kind)
+        .map_err(|e| json_error(StatusCode::BAD_REQUEST, &e.to_string()))?;
+    let backend_kind = crate::agent_backends::BackendKind::from_str(&body.backend_kind)
+        .map_err(|e| json_error(StatusCode::BAD_REQUEST, &e.to_string()))?;
+    let caller_phase = match body.caller_phase.as_deref() {
+        None | Some("") => None,
+        Some(p) => Some(
+            serde_json::from_str::<crate::routing::OodaPhase>(&format!("\"{}\"", p)).map_err(
+                |_| {
+                    json_error(
+                        StatusCode::BAD_REQUEST,
+                        &format!("invalid caller_phase: {p}"),
+                    )
+                },
+            )?,
+        ),
+    };
+    let policy = crate::routing::create_policy(crate::routing::CreateRoutingPolicyInput {
+        id: None,
+        work_kind,
+        caller_phase,
+        backend_kind,
+        profile_id: body.profile_id,
+        priority: body.priority.unwrap_or(0),
+        enabled: body.enabled.unwrap_or(true),
+        reason_template: body.reason_template,
+    })
+    .await
+    .map_err(|e| json_error(StatusCode::BAD_REQUEST, &e.to_string()))?;
+    Ok((StatusCode::CREATED, Json(serde_json::json!(policy))))
+}
+
+async fn delete_routing_policy_handler(
+    Path(policy_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    crate::routing::delete_policy(&policy_id)
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("not found") {
+                json_error(StatusCode::NOT_FOUND, &msg)
+            } else {
+                json_error(StatusCode::INTERNAL_SERVER_ERROR, &msg)
+            }
+        })?;
+    Ok(Json(
+        serde_json::json!({ "deleted": true, "policy_id": policy_id }),
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // SSE event stream handler
 // ---------------------------------------------------------------------------
 
@@ -931,6 +1219,402 @@ pub fn generate_runtime_token() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Graph snapshot handler (P5)
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize)]
+pub struct GoalGraphSnapshot {
+    pub goal_id: String,
+    pub goal_title: String,
+    pub objective: String,
+    pub graph_hash: String,
+    pub facts: Vec<FactEntry>,
+    pub intents: Vec<IntentEntry>,
+    pub hints: Vec<HintEntry>,
+    pub edges: Vec<GraphEdge>,
+    pub recent_events: Vec<serde_json::Value>,
+    /// The request_id of the ChatTurn associated with the current cycle, if any.
+    pub chat_turn_request_id: Option<String>,
+    pub chat_turn_request_ids: Vec<String>,
+    pub chat_turns: Vec<GraphChatTurn>,
+}
+
+#[derive(serde::Serialize)]
+pub struct FactEntry {
+    pub id: String,
+    pub key: String,
+    pub summary: String,
+    pub category: String,
+    pub source_turn_id: Option<String>,
+    pub source_tool_call_id: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct IntentEntry {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    pub instruction: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct HintEntry {
+    pub id: String,
+    pub content: String,
+    pub kind: String,
+    pub created_at: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct GraphChatTurn {
+    pub id: String,
+    pub request_id: String,
+    pub agent_task_id: Option<String>,
+    pub status: String,
+    pub started_at: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct GraphEdge {
+    pub id: String,
+    pub from: String,
+    pub to: String,
+    pub relation: String,
+    pub label: String,
+}
+
+#[derive(Deserialize)]
+struct GraphFormatQuery {
+    format: Option<String>,
+}
+
+pub async fn build_goal_graph_snapshot(goal_id: &str) -> anyhow::Result<Option<GoalGraphSnapshot>> {
+    let Some(goal) = crate::goals::get_goal(goal_id).await? else {
+        return Ok(None);
+    };
+
+    // Collect open intents (proposed/queued/claimed tasks)
+    let all_tasks = crate::goal_tasks::list_tasks_by_goal(goal_id)
+        .await
+        .unwrap_or_default();
+    let intents: Vec<IntentEntry> = all_tasks
+        .into_iter()
+        .filter(|t| matches!(t.status.as_str(), "proposed" | "queued" | "claimed"))
+        .map(|t| IntentEntry {
+            id: t.id,
+            title: t.title,
+            status: t.status,
+            instruction: t.instruction,
+        })
+        .collect();
+
+    // Collect facts from memory_entries scoped to this goal
+    let facts: Vec<FactEntry> = {
+        let pool = crate::db::pool().await?;
+        sqlx::query(
+            "SELECT id, key, substr(value, 1, 500) AS summary, category, source_turn_id, source_tool_call_id FROM memory_entries WHERE goal_id = ? ORDER BY updated_at DESC LIMIT 50",
+        )
+        .bind(goal_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| {
+            use sqlx::Row;
+            FactEntry {
+                id: r.try_get("id").unwrap_or_default(),
+                key: r.try_get("key").unwrap_or_default(),
+                summary: r.try_get("summary").unwrap_or_default(),
+                category: r.try_get("category").unwrap_or_default(),
+                source_turn_id: r.try_get("source_turn_id").ok(),
+                source_tool_call_id: r.try_get("source_tool_call_id").ok(),
+            }
+        })
+        .collect()
+    };
+
+    // Collect hints (table may not exist yet — ignore errors)
+    let hints: Vec<HintEntry> = crate::goal_hints::list_active_hints(goal_id, None)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|h| HintEntry {
+            id: h.id,
+            content: h.content,
+            kind: h.kind,
+            created_at: h.created_at.to_rfc3339(),
+        })
+        .collect();
+
+    // Recent events (last 20)
+    let recent_events: Vec<serde_json::Value> =
+        crate::events::query_events_db(&goal.workspace_id, None, Some(20))
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| serde_json::to_value(e).unwrap_or_default())
+            .collect();
+
+    // Resolve ChatTurns for the current cycle (bidirectional anchors)
+    let chat_turns: Vec<GraphChatTurn> = if let Some(ref cycle_id) = goal.current_cycle_id {
+        crate::chat::list_turns_by_goal_cycle_id(cycle_id)
+            .await
+            .ok()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|turn| GraphChatTurn {
+                id: turn.id,
+                request_id: turn.request_id,
+                agent_task_id: turn.agent_task_id,
+                status: turn.status,
+                started_at: turn.started_at.to_rfc3339(),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let chat_turn_request_ids = chat_turns
+        .iter()
+        .map(|turn| turn.request_id.clone())
+        .collect::<Vec<_>>();
+    let chat_turn_request_id = chat_turn_request_ids.first().cloned();
+    let edges = build_goal_graph_edges(
+        &goal.id,
+        &facts,
+        &intents,
+        &hints,
+        &recent_events,
+        &chat_turns,
+    );
+    let graph_hash =
+        compute_graph_snapshot_hash(&goal.id, &goal.objective, &facts, &intents, &hints, &edges);
+
+    Ok(Some(GoalGraphSnapshot {
+        goal_id: goal.id,
+        goal_title: goal.title,
+        objective: goal.objective,
+        graph_hash,
+        facts,
+        intents,
+        hints,
+        edges,
+        recent_events,
+        chat_turn_request_id,
+        chat_turn_request_ids,
+        chat_turns,
+    }))
+}
+
+fn build_goal_graph_edges(
+    goal_id: &str,
+    facts: &[FactEntry],
+    intents: &[IntentEntry],
+    hints: &[HintEntry],
+    recent_events: &[serde_json::Value],
+    chat_turns: &[GraphChatTurn],
+) -> Vec<GraphEdge> {
+    let goal_node = format!("goal:{goal_id}");
+    let mut edges = Vec::new();
+
+    for fact in facts {
+        let fact_node = format!("fact:{}", fact.id);
+        if let Some(source_turn_id) = fact.source_turn_id.as_deref().filter(|id| !id.is_empty()) {
+            edges.push(GraphEdge {
+                id: format!("edge:turn-fact:{source_turn_id}:{}", fact.id),
+                from: format!("turn:{source_turn_id}"),
+                to: fact_node.clone(),
+                relation: "produced_fact".to_string(),
+                label: "turn -> fact".to_string(),
+            });
+        } else {
+            edges.push(GraphEdge {
+                id: format!("edge:goal-fact:{goal_id}:{}", fact.id),
+                from: goal_node.clone(),
+                to: fact_node.clone(),
+                relation: "has_fact".to_string(),
+                label: "goal -> fact".to_string(),
+            });
+        }
+
+        if let Some(tool_call_id) = fact
+            .source_tool_call_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+        {
+            edges.push(GraphEdge {
+                id: format!("edge:tool-fact:{tool_call_id}:{}", fact.id),
+                from: format!("tool_call:{tool_call_id}"),
+                to: fact_node,
+                relation: "contributed_fact".to_string(),
+                label: "tool -> fact".to_string(),
+            });
+        }
+    }
+
+    for intent in intents {
+        edges.push(GraphEdge {
+            id: format!("edge:goal-intent:{goal_id}:{}", intent.id),
+            from: goal_node.clone(),
+            to: format!("intent:{}", intent.id),
+            relation: "has_open_intent".to_string(),
+            label: "goal -> intent".to_string(),
+        });
+    }
+
+    for hint in hints {
+        edges.push(GraphEdge {
+            id: format!("edge:hint-goal:{}:{goal_id}", hint.id),
+            from: format!("hint:{}", hint.id),
+            to: goal_node.clone(),
+            relation: "guides_goal".to_string(),
+            label: "hint -> goal".to_string(),
+        });
+    }
+
+    for turn in chat_turns {
+        let turn_node = format!("turn:{}", turn.id);
+        edges.push(GraphEdge {
+            id: format!("edge:goal-turn:{goal_id}:{}", turn.id),
+            from: goal_node.clone(),
+            to: turn_node.clone(),
+            relation: "has_turn".to_string(),
+            label: "goal -> turn".to_string(),
+        });
+
+        if let Some(task_id) = turn.agent_task_id.as_deref().filter(|id| !id.is_empty()) {
+            let task_node = format!("task:{task_id}");
+            edges.push(GraphEdge {
+                id: format!("edge:goal-task:{goal_id}:{task_id}"),
+                from: goal_node.clone(),
+                to: task_node.clone(),
+                relation: "dispatches_task".to_string(),
+                label: "goal -> task".to_string(),
+            });
+            edges.push(GraphEdge {
+                id: format!("edge:task-turn:{task_id}:{}", turn.id),
+                from: task_node,
+                to: turn_node,
+                relation: "executed_as_turn".to_string(),
+                label: "task -> turn".to_string(),
+            });
+        }
+    }
+
+    for (index, event) in recent_events.iter().enumerate() {
+        let event_id = event
+            .get("id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{index}"));
+        edges.push(GraphEdge {
+            id: format!("edge:goal-event:{goal_id}:{event_id}"),
+            from: goal_node.clone(),
+            to: format!("event:{event_id}"),
+            relation: "has_recent_event".to_string(),
+            label: "goal -> event".to_string(),
+        });
+    }
+
+    edges
+}
+
+fn compute_graph_snapshot_hash(
+    goal_id: &str,
+    objective: &str,
+    facts: &[FactEntry],
+    intents: &[IntentEntry],
+    hints: &[HintEntry],
+    edges: &[GraphEdge],
+) -> String {
+    const FNV_OFFSET: u64 = 14695981039346656037;
+    const FNV_PRIME: u64 = 1099511628211;
+
+    let mut hash: u64 = FNV_OFFSET;
+    let mut feed = |s: &str| {
+        for b in s.bytes() {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash ^= 0xFF;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    };
+
+    feed("goal");
+    feed(goal_id);
+    feed(objective);
+
+    let mut facts = facts.iter().collect::<Vec<_>>();
+    facts.sort_by(|a, b| a.id.cmp(&b.id));
+    for fact in facts {
+        feed("fact");
+        feed(&fact.id);
+        feed(&fact.key);
+        feed(&fact.category);
+        feed(&fact.summary);
+        feed(fact.source_turn_id.as_deref().unwrap_or(""));
+        feed(fact.source_tool_call_id.as_deref().unwrap_or(""));
+    }
+
+    let mut intents = intents.iter().collect::<Vec<_>>();
+    intents.sort_by(|a, b| a.id.cmp(&b.id));
+    for intent in intents {
+        feed("intent");
+        feed(&intent.id);
+        feed(&intent.status);
+        feed(&intent.title);
+        feed(&intent.instruction);
+    }
+
+    let mut hints = hints.iter().collect::<Vec<_>>();
+    hints.sort_by(|a, b| a.id.cmp(&b.id));
+    for hint in hints {
+        feed("hint");
+        feed(&hint.id);
+        feed(&hint.kind);
+        feed(&hint.content);
+        feed(&hint.created_at);
+    }
+
+    let mut edges = edges.iter().collect::<Vec<_>>();
+    edges.sort_by(|a, b| a.id.cmp(&b.id));
+    for edge in edges {
+        feed("edge");
+        feed(&edge.id);
+        feed(&edge.from);
+        feed(&edge.to);
+        feed(&edge.relation);
+    }
+
+    format!("{hash:016x}")
+}
+
+async fn get_goal_graph_handler(
+    Path(goal_id): Path<String>,
+    Query(q): Query<GraphFormatQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let snapshot = build_goal_graph_snapshot(&goal_id)
+        .await
+        .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .ok_or_else(|| json_error(StatusCode::NOT_FOUND, &format!("goal not found: {goal_id}")))?;
+
+    let format = q.format.as_deref().unwrap_or("json");
+    if format == "yaml" {
+        let yaml = serde_yaml::to_string(&snapshot)
+            .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+        Ok((
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/x-yaml; charset=utf-8",
+            )],
+            yaml,
+        )
+            .into_response())
+    } else {
+        Ok(Json(serde_json::to_value(snapshot).unwrap_or_default()).into_response())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1002,6 +1686,61 @@ mod tests {
         assert_eq!(a.len(), 32, "token should be 32 hex chars");
         assert_eq!(b.len(), 32);
         assert_ne!(a, b, "sequential tokens must differ");
+    }
+
+    #[test]
+    fn goal_graph_edges_connect_turns_facts_tasks_hints_and_events() {
+        let facts = vec![FactEntry {
+            id: "fact-1".to_string(),
+            key: "turn:req-1:assistant_final_answer".to_string(),
+            summary: "summary".to_string(),
+            category: "goal_turn_summary".to_string(),
+            source_turn_id: Some("turn-1".to_string()),
+            source_tool_call_id: Some("tool-1".to_string()),
+        }];
+        let intents = vec![IntentEntry {
+            id: "intent-1".to_string(),
+            title: "continue".to_string(),
+            status: "queued".to_string(),
+            instruction: "continue work".to_string(),
+        }];
+        let hints = vec![HintEntry {
+            id: "hint-1".to_string(),
+            content: "focus".to_string(),
+            kind: "user".to_string(),
+            created_at: "2026-06-06T00:00:00Z".to_string(),
+        }];
+        let events = vec![serde_json::json!({ "id": "event-1", "event_type": "goal.updated" })];
+        let turns = vec![GraphChatTurn {
+            id: "turn-1".to_string(),
+            request_id: "req-1".to_string(),
+            agent_task_id: Some("task-1".to_string()),
+            status: "completed".to_string(),
+            started_at: "2026-06-06T00:00:00Z".to_string(),
+        }];
+
+        let edges = build_goal_graph_edges("goal-1", &facts, &intents, &hints, &events, &turns);
+        let has_edge = |from: &str, to: &str, relation: &str| {
+            edges
+                .iter()
+                .any(|edge| edge.from == from && edge.to == to && edge.relation == relation)
+        };
+
+        assert!(has_edge("turn:turn-1", "fact:fact-1", "produced_fact"));
+        assert!(has_edge(
+            "tool_call:tool-1",
+            "fact:fact-1",
+            "contributed_fact"
+        ));
+        assert!(has_edge(
+            "goal:goal-1",
+            "intent:intent-1",
+            "has_open_intent"
+        ));
+        assert!(has_edge("hint:hint-1", "goal:goal-1", "guides_goal"));
+        assert!(has_edge("goal:goal-1", "turn:turn-1", "has_turn"));
+        assert!(has_edge("task:task-1", "turn:turn-1", "executed_as_turn"));
+        assert!(has_edge("goal:goal-1", "event:event-1", "has_recent_event"));
     }
 
     // -- Test helper -----------------------------------------------------------

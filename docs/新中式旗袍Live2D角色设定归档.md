@@ -2354,4 +2354,180 @@ brand logos, Claude logo, Codex logo
 
 ---
 
-*归档日期：2026-05-19*
+*归档日期：2026-05-19（v3 冻结版），2026-06-04 增补 12.16 节。*
+
+---
+
+### 12.16 桌宠静态 PNG 动态化专用生图 Prompt（2026-06-04 增补）
+
+> **来源**：综合 12.14 「Q版脸 + 正式版身材」变体（综合观感最好的混合风格），增补桌宠静态 PNG 动态化项目所需的全部生图任务。
+>
+> **画布规格**：
+> - 主形象 320×420 px（角色高度 90%，脚底贴 y≈380）
+> - 关系图标 32×32 px（实际图案 ≤ 24×24）
+> - 仪式插画 1280×800 px（背景）；装饰条 320×80 px
+>
+> **格式**：PNG-24 + Alpha 通道，sRGB，< 200KB/张
+>
+> **基础风格**：`semi-chibi proportions, head roughly 1/3 of total body height, round cute face + realistic adult female body`
+>
+> **眼位约束（关键）**：所有主图的眼睛中心必须落在 `y=22%`、眼高 `7%`（用于前端 CSS mask 眨眼）。`--eye-y: 22%; --eye-h: 7%;`
+
+#### 12.16.0 统一角色块 + 统一 Negative（所有主图共享）
+
+```text
+1girl, solo, desktop pet sprite, upper body bust shot from waist up,
+semi-chibi proportions, head slightly larger than realistic but NOT full chibi
+(roughly 1/3 of total body height),
+round cute face with large dark expressive eyes, small nose, tiny red lips,
+gentle soft expression, eyes centered at 22% from top, eye height 7% of total,
+but body retains realistic adult female proportions, slender arms, detailed elegant hands,
+
+young cute chinese woman, medium-length brown hair, half-up hairstyle with
+pearl hairpins, loose face-framing strands,
+[QIPAO_VARIANT]    ← 见 12.16.1 三选一
+pearl drop earrings, black square smartwatch with black strap on LEFT wrist,
+double-layer beaded bracelet on RIGHT wrist, thin silver ring on right hand,
+dark teal / muted cyan nail polish clearly visible,
+
+anime key visual style, clean line art, soft cel shading, highly detailed, official art style,
+solid pure white background, no shadows, no gradients, isolated character and props, clean silhouette,
+soft overcast lighting, muted color palette,
+masterpiece, best quality, 8k, ultra detailed,
+```
+
+统一 Negative（叠加在 12.15 之上，主图专用）：
+
+```text
+full chibi super deformed proportions, tiny stubby limbs, oversized head
+taking half body height, realistic photorealistic face, mature adult face,
+sharp angular jawline, eyes outside y=22% region,
+different outfit, casual clothing, hoodie, school uniform, office suit,
+standing pose, walking pose, full body standing, floating pose,
+black hair, blonde hair, short hair, twin tails,
+missing pearl hairpins, tassels, missing smartwatch, missing bracelet,
+missing red bead buttons, traditional knotted buttons, butterfly knot buttons,
+busy background, readable text, logo, watermark, signature,
+distorted hands, extra fingers, fused fingers, hidden wrists, bad anatomy,
+colored background, grey background, checkerboard background, fake transparent background,
+scenic background, shadow on background, floor shadow,
+multiple characters, character clones, duplicate body, split panels
+```
+
+#### 12.16.1 旗袍颜色三选一
+
+| 变体 ID | 用途 | prompt 片段（替换 [QIPAO_VARIANT]） |
+|---|---|---|
+| `QIPAO_NAVY` | 默认主推（文书） | `wearing dark navy blue sleeveless modified qipao dress, traditional mandarin collar, bodycon fit, matte fabric with good drape, 5 red round bead buttons on diagonal placket, small red round beads, NOT traditional knotted buttons` |
+| `QIPAO_IVORY` | 程序员（工作站） | `wearing ivory white sleeveless modified qipao dress with subtle dark floral jacquard texture, traditional mandarin collar, bodycon fit, silk-like sheen, 5 silver round bead buttons on diagonal placket, side slit` |
+| `QIPAO_BURGUNDY` | 旗袍 / 新中式（P2） | `wearing burgundy red sleeveless modified qipao dress, traditional mandarin collar, bodycon fit, satin fabric with gentle sheen, 5 gold round bead buttons on diagonal placket, side slit` |
+
+#### 12.16.2 主形象 · 清和 · 文书（6 张，P0 必需）
+
+> 服饰：`QIPAO_NAVY`；场景：传统书写桌（砚台、毛笔、米字格宣纸、镇纸）
+> 共用：12.16.0 统一角色块 + 12.16.1 选 NAVY + 12.16.0 统一 Negative
+> 仅描述「姿态差异」追加在统一角色块之后。
+
+| # | 文件名 | 对应归档 | 姿态差异 prompt |
+|---|---|---|---|
+| 1 | `qinghe/normal.png` | 12.14.11 | `seated at a traditional writing desk, both hands resting naturally on the desk near rice paper, calm idle posture, eyes soft and gazing forward, gentle tiny smile` |
+| 2 | `qinghe/thinking.png` | 12.14.3 | `seated at the writing desk, both hands supporting her cheeks, elbows resting on the desk, eyes looking directly at the camera with playful thoughtful expression, a calligraphy brush placed on brush rest on the desk, NOT held in hands or mouth` |
+| 3 | `qinghe/sleepy.png` | 12.14.16 | `seated at the writing desk, one eye squeezed shut mid-yawn with a tiny tear droplet at the corner, the other half-closed and drowsy, one hand loosely covering the mouth, the other hand resting on the desk, brush placed on brush rest, languid break time` |
+| 4 | `qinghe/writing.png` | 12.14.4 | `seated at the writing desk, right hand sweeping a calligraphy brush in bold flowing arc, left hand pressing the rice paper steady, confident upright posture, abstract flowing ink strokes on paper with no readable text` |
+| 5 | `qinghe/error.png` | 12.14.12 | `seated at the writing desk, holding a calligraphy brush vertically in her mouth like a thinking gesture, a small abstract question mark floating above the head, eyebrows furrowed slightly, looking at the rice paper with puzzled expression` |
+| 6 | `qinghe/done.png` | 12.14.13 | `seated at the writing desk, brush placed down on brush rest, both hands lightly clasped before chest, eyes gently closed with satisfied smile, small abstract check mark floating beside the rice paper, peaceful completed expression` |
+
+#### 12.16.3 主形象 · 清和 · 程序员（5 张，P0 必需）
+
+> 服饰：`QIPAO_IVORY`；场景：现代工作站（人体工学椅、显示器、键盘、鼠标）
+> 显示器内容用"abstract code blocks / patch diff shapes"代替，禁止可读文字。
+
+| # | 文件名 | 对应归档 | 姿态差异 prompt |
+|---|---|---|---|
+| 1 | `programmer/normal.png` | 12.14.11 改造 | `seated in an ergonomic chair at a modern workstation, both hands resting naturally on the desk near a compact keyboard, computer monitor behind showing abstract blurred code blocks with no readable text, calm ready posture` |
+| 2 | `programmer/thinking.png` | 12.14.5 | `seated in an ergonomic chair leaning far back comfortably, both hands clasped behind the head with elbows spread outward, computer monitor showing abstract blurred code, lazy thoughtful gaze looking slightly upward` |
+| 3 | `programmer/sleepy.png` | 12.14.16 改造 | `seated at the workstation, one hand loosely covering a yawn, eyelids drooping, other hand resting on the desk near the keyboard, monitor dimly lit and showing abstract dimmed code, drowsy at the keyboard` |
+| 4 | `programmer/coding.png` | 12.14.7 | `seated in an ergonomic chair leaning forward close to the monitor, both hands typing rapidly on a compact keyboard with mouse beside, monitor showing abstract code blocks and patch diff shapes, focused and efficient posture` |
+| 5 | `programmer/done.png` | 12.14.9 | `seated in the chair leaning back slightly, right hand raised with index finger placed vertically at the center of her lips in a quiet "shh" gesture, left hand resting on the armrest, half-lidded confident gaze at the viewer, monitor showing abstract green check visual` |
+
+#### 12.16.4 主形象 · 清和 · 旗袍 / 新中式（5 张，P2 可选）
+
+> 服饰：`QIPAO_BURGUNDY`；场景：依活动选择（无固定工作台，立姿居多）
+
+| # | 文件名 | 对应归档 | 姿态差异 prompt |
+|---|---|---|---|
+| 1 | `qipao/normal.png` | 12.14.1 改立姿 | `standing upright with elegant posture, body facing slightly 3/4 angle, head upright, hands lightly clasped before waist, calm poised expression, no props` |
+| 2 | `qipao/thinking.png` | 12.14.3 改立姿 | `standing with one hand holding a closed folding fan near the chin, the other hand on the waist, playful thoughtful expression, head tilted 3 degrees` |
+| 3 | `qipao/sleepy.png` | 12.14.16 改立姿 | `standing with one hand lightly covering a yawn, shoulders dropped, head slightly tilted, fan held loosely in the other hand at her side` |
+| 4 | `qipao/leading.png` | 12.14.6 改造 | `standing upright in a ceremonial posture, right hand raised and pointing forward in a presenting gesture, left hand at the waist holding a closed fan, dignified but warm expression` |
+| 5 | `qipao/done.png` | 12.14.13 改立姿 | `standing in a slight bow of thanks, hands lightly clasped before chest, eyes gently closed, satisfied graceful smile` |
+
+#### 12.16.5 关系阶段图标（5 张，P1 必需）
+
+> 画布 32×32 px；线稿为主；纯白背景；同一系列统一 1.5px 描边
+> 颜色按段位渐变：stranger 灰 → close_friend 知性紫 + 金
+
+| # | 文件名 | prompt |
+|---|---|---|
+| 1 | `relationship/stranger.png` | `icon, single small empty circle outline, thin 1.5px stroke, color #9ca3af (cool gray), centered on pure white background, simple clean line art, no fill, no decoration, 32x32 canvas, no text` |
+| 2 | `relationship/initial.png` | `icon, single small flower bud with one leaf, line art with soft fill, color #a5b4fc (pale lavender), centered on pure white background, 32x32 canvas, gentle cute style, no text` |
+| 3 | `relationship/colleague.png` | `icon, single small branch with two leaves, line art with soft fill, color #818cf8 (indigo), centered on pure white background, 32x32 canvas, neat clean style, no text` |
+| 4 | `relationship/friend.png` | `icon, two overlapping flower petals forming a small blossom, line art with soft fill, color #a78bfa (violet), centered on pure white background, 32x32 canvas, friendly warm style, no text` |
+| 5 | `relationship/close_friend.png` | `icon, small blooming flower with one tiny glowing highlight dot above, line art with soft fill, color #c4b5fd (lavender) with single #fcd34d (gold) highlight, centered on pure white background, 32x32 canvas, intimate warm style, no text` |
+
+> 统一 Negative（适用全部关系图标）：
+> `filled background, dark background, multiple icons, complex detail,
+> realistic photo, 3D render, text, watermark, distorted shapes`
+
+#### 12.16.6 仪式感插画（4 张，P1 可选；多数可改用 SVG 兜底）
+
+| # | 文件名 | 画布 | prompt |
+|---|---|---|---|
+| 1 | `ceremony/welcome.png` | 1280×800 | `background illustration, soft warm light circular gradient centered, delicate ring of small floating light particles, muted cream and pale lavender palette, anime background art style, peaceful inviting atmosphere, no characters, suitable for text overlay` |
+| 2 | `ceremony/stage_up.png` | 1280×800 | `background illustration, soft radial light burst from upper center, scattered delicate petal shapes and small star sparkles floating outward, pale indigo and gold palette, anime background art style, ceremonial celebratory atmosphere, no characters, suitable for text overlay` |
+| 3 | `ceremony/festival_lantern.png` | 320×80 | `icon strip, row of three small chinese lanterns hanging from a thin horizontal line, red and gold color palette, gentle swaying implied, transparent background, 320x80 canvas, line art with soft fill, no text` |
+| 4 | `ceremony/heart_floating.png` | 60×60 | `icon sprite sheet, three small heart shapes of varying sizes (12px, 16px, 20px) arranged in a small cluster, soft pink #f9a8d4 to lavender #c4b5fd gradient, transparent background, 60x60 canvas, no text` |
+
+> 统一 Negative（适用全部仪式插画）：
+> `characters, people, text, watermark, busy composition,
+> dark background, harsh colors, realistic photo`
+
+#### 12.16.7 一致性约束（重要，生成后人工自检）
+
+1. **姿态间对位**：同一系列 normal/thinking/sleepy/error/done 必须**几乎同一张图**，
+   差异 ≤ 1-2mm，避免 CSS 切换时头部跳动
+2. **眼位精确**：`y=22%`、`h=7%`（CSS mask blink 用此参数）；眼睛中心误差 ≤ 2px
+3. **脚底锚点**：所有主图 transform-origin 在 y=92%（即 `50% 92%`）；角色重心靠下
+4. **头部位置偏差**：同一系列各姿态头部中心误差 ≤ 4px
+5. **服装不变**：同一 avatar 跨姿态的服装、发型、配饰完全一致
+6. **PNG 自检脚本**：
+   ```bash
+   for f in qinghe/*.png programmer/*.png qipao/*.png; do
+     convert "$f" -trim +repage -bordercolor none -border 1 "${f%.png}_safe.png"
+   done
+   ```
+   应得到带 1px 安全边的透明 PNG；可肉眼对比正常描边
+
+#### 12.16.8 目录与命名
+
+```
+apps/desktop/src-tauri/resources/avatar/
+├── qinghe/         ← QIPAO_NAVY,    6 张 (P0)
+├── programmer/     ← QIPAO_IVORY,   5 张 (P0)
+├── qipao/          ← QIPAO_BURGUNDY,5 张 (P2)
+├── relationship/   ← 32×32 关系图标, 5 张 (P1)
+└── ceremony/       ← 仪式感插画,    4 张 (P1, 可全 SVG 替代)
+```
+
+#### 12.16.9 验收口径
+
+- 5 张姿态图（normal/thinking/sleepy/error/done）叠在一起能重合 ≥ 95%
+- `--eye-y=22%`、`--eye-h=7%` 的位置画在眼睛中央
+- 透明背景无杂边（自检脚本通过）
+- 文件大小 < 200KB/张
+- 缩到 50% 后表情依然可辨
+- 桌面 320×420 实际显示尺寸，角色居中、脚底贴 y=380
+
+---
+
+*本节内容专为桌宠静态 PNG 动态化项目（docs/桌宠静态PNG动态化与前端综合优化方案-20260604.md）准备；与 Live2D rigging 解耦，仅作静态 PNG 资产。*

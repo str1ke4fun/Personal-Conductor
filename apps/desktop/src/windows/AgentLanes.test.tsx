@@ -109,7 +109,7 @@ describe('AgentLanes', () => {
     expect(screen.getByText('最近请求:')).toBeTruthy();
     expect(screen.getByText(/Review the latest execution\./)).toBeTruthy();
     expect(screen.getByText(/coder/i).closest('.agent-lane-task')?.textContent).toBe(
-      'coder | 已绑定执行器 | heartbeat 4s'
+      'coder | active | 已绑定执行器 | heartbeat 4s'
     );
     expect(screen.queryByText(/task-7/)).toBeNull();
     expect(screen.queryByText(/session-9/)).toBeNull();

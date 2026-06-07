@@ -9,9 +9,12 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
 
+// D-1: WorkKind and OodaPhase are mirrored in model-router-core::types.
+/// The kind of work being dispatched — used for backend selection and routing.
+/// Renamed from `TaskKind`; use `WorkKind` in new code.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum TaskKind {
+pub enum WorkKind {
     Planning,
     Coding,
     Review,
@@ -20,7 +23,10 @@ pub enum TaskKind {
     ExternalAction,
 }
 
-impl TaskKind {
+/// Backward-compatibility alias — prefer `WorkKind` in new code.
+pub type TaskKind = WorkKind;
+
+impl WorkKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Planning => "planning",
@@ -40,7 +46,7 @@ impl TaskKind {
             "testing" => Ok(Self::Testing),
             "document" => Ok(Self::Document),
             "external_action" => Ok(Self::ExternalAction),
-            other => bail!("unknown task kind: {other}"),
+            other => bail!("unknown work kind: {other}"),
         }
     }
 
@@ -65,10 +71,37 @@ impl TaskKind {
     }
 }
 
+/// Phase within the OODA loop — used to route LLM calls to different models
+/// depending on which cognitive stage is active.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OodaPhase {
+    /// Bootstrap: first attempt to solve the goal directly.
+    Bootstrap,
+    /// Reason: read the whole graph, judge if goal is met, generate new intents.
+    Reason,
+    /// Explore: claim one open intent and execute it.
+    Explore,
+    /// Review: evaluate task output against acceptance criteria.
+    Review,
+}
+
+impl OodaPhase {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Bootstrap => "bootstrap",
+            Self::Reason => "reason",
+            Self::Explore => "explore",
+            Self::Review => "review",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct RoutingPolicy {
     pub id: String,
-    pub task_kind: TaskKind,
+    pub work_kind: WorkKind,
+    pub caller_phase: Option<OodaPhase>,
     pub backend_kind: BackendKind,
     pub profile_id: Option<String>,
     pub priority: i64,
@@ -83,7 +116,8 @@ pub struct RouteDecision {
     pub id: String,
     pub workspace_id: String,
     pub task_id: Option<String>,
-    pub task_kind: TaskKind,
+    pub work_kind: WorkKind,
+    pub ooda_phase: Option<OodaPhase>,
     pub policy_id: Option<String>,
     pub backend_id: Option<String>,
     pub backend_kind: BackendKind,
@@ -96,7 +130,8 @@ pub struct RouteDecision {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CreateRoutingPolicyInput {
     pub id: Option<String>,
-    pub task_kind: TaskKind,
+    pub work_kind: WorkKind,
+    pub caller_phase: Option<OodaPhase>,
     pub backend_kind: BackendKind,
     pub profile_id: Option<String>,
     pub priority: i64,
@@ -115,13 +150,15 @@ pub struct UpdateRoutingPolicyInput {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct RoutingPolicyFilter {
-    pub task_kind: Option<TaskKind>,
+    pub work_kind: Option<WorkKind>,
+    pub caller_phase: Option<OodaPhase>,
     pub enabled: Option<bool>,
     pub limit: Option<u32>,
 }
 
 /// Classify a task with deterministic rules before any model routing is used.
-pub fn classify_task(title: &str, instruction: &str) -> TaskKind {
+// A-1: returns WorkKind (TaskKind is a deprecated alias — prefer WorkKind in new code)
+pub fn classify_task(title: &str, instruction: &str) -> WorkKind {
     let text = format!("{title}\n{instruction}").to_lowercase();
 
     if contains_any(
@@ -206,8 +243,9 @@ pub async fn create_policy(input: CreateRoutingPolicyInput) -> anyhow::Result<Ro
             .unwrap_or_else(|| format!("route-policy-{}", Uuid::new_v4())),
         reason_template: input
             .reason_template
-            .unwrap_or_else(|| input.task_kind.default_reason_template().to_string()),
-        task_kind: input.task_kind,
+            .unwrap_or_else(|| input.work_kind.default_reason_template().to_string()),
+        work_kind: input.work_kind,
+        caller_phase: input.caller_phase,
         backend_kind: input.backend_kind,
         profile_id: input.profile_id,
         priority: input.priority,
@@ -224,7 +262,7 @@ pub async fn get_policy(policy_id: &str) -> anyhow::Result<Option<RoutingPolicy>
     let pool = db::pool().await?;
     let row = sqlx::query(
         r#"
-        SELECT id, task_kind, backend_kind, profile_id, priority, enabled,
+        SELECT id, task_kind, caller_phase, backend_kind, profile_id, priority, enabled,
                reason_template, created_at, updated_at
         FROM routing_policies
         WHERE id = ?1
@@ -242,7 +280,7 @@ pub async fn list_policies(filter: RoutingPolicyFilter) -> anyhow::Result<Vec<Ro
     let limit = filter.limit.unwrap_or(100).clamp(1, 500) as i64;
     let rows = sqlx::query(
         r#"
-        SELECT id, task_kind, backend_kind, profile_id, priority, enabled,
+        SELECT id, task_kind, caller_phase, backend_kind, profile_id, priority, enabled,
                reason_template, created_at, updated_at
         FROM routing_policies
         ORDER BY task_kind ASC, priority DESC, created_at ASC
@@ -258,8 +296,15 @@ pub async fn list_policies(filter: RoutingPolicyFilter) -> anyhow::Result<Vec<Ro
         .map(row_to_policy)
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    if let Some(task_kind) = filter.task_kind {
-        policies.retain(|policy| policy.task_kind == task_kind);
+    if let Some(work_kind) = filter.work_kind {
+        policies.retain(|policy| policy.work_kind == work_kind);
+    }
+    if let Some(ref phase) = filter.caller_phase {
+        // Policies with caller_phase = None are wildcards that match any phase.
+        // Policies with a specific caller_phase must match exactly.
+        policies.retain(|policy| {
+            policy.caller_phase.is_none() || policy.caller_phase.as_ref() == Some(phase)
+        });
     }
     if let Some(enabled) = filter.enabled {
         policies.retain(|policy| policy.enabled == enabled);
@@ -291,7 +336,7 @@ pub async fn update_policy(
     }
     if let Some(reason_template) = input.reason_template {
         policy.reason_template = reason_template
-            .unwrap_or_else(|| policy.task_kind.default_reason_template().to_string());
+            .unwrap_or_else(|| policy.work_kind.default_reason_template().to_string());
     }
     policy.updated_at = Utc::now();
 
@@ -336,21 +381,22 @@ pub async fn delete_policy(policy_id: &str) -> anyhow::Result<()> {
 /// Seed the deterministic default routing table used when the user has not
 /// configured custom policies yet.
 pub async fn seed_default_policies() -> anyhow::Result<()> {
-    for task_kind in [
-        TaskKind::Planning,
-        TaskKind::Coding,
-        TaskKind::Review,
-        TaskKind::Testing,
-        TaskKind::Document,
-        TaskKind::ExternalAction,
+    for work_kind in [
+        WorkKind::Planning,
+        WorkKind::Coding,
+        WorkKind::Review,
+        WorkKind::Testing,
+        WorkKind::Document,
+        WorkKind::ExternalAction,
     ] {
-        let id = format!("route-default-{}", task_kind.as_str());
+        let id = format!("route-default-{}", work_kind.as_str());
         if get_policy(&id).await?.is_none() {
             create_policy(CreateRoutingPolicyInput {
                 id: Some(id),
-                backend_kind: task_kind.default_backend_kind(),
-                reason_template: Some(task_kind.default_reason_template().to_string()),
-                task_kind,
+                backend_kind: work_kind.default_backend_kind(),
+                reason_template: Some(work_kind.default_reason_template().to_string()),
+                work_kind,
+                caller_phase: None,
                 profile_id: None,
                 priority: 0,
                 enabled: true,
@@ -362,8 +408,8 @@ pub async fn seed_default_policies() -> anyhow::Result<()> {
 }
 
 pub async fn route_task(task: &AgentTask) -> anyhow::Result<RouteDecision> {
-    let task_kind = classify_task(&task.title, &task.instruction);
-    route_task_kind(&task.workspace_id, Some(&task.id), task_kind).await
+    let work_kind = classify_task(&task.title, &task.instruction);
+    route_task_kind(&task.workspace_id, Some(&task.id), work_kind).await
 }
 
 pub async fn route_text(
@@ -371,8 +417,8 @@ pub async fn route_text(
     title: &str,
     instruction: &str,
 ) -> anyhow::Result<RouteDecision> {
-    let task_kind = classify_task(title, instruction);
-    route_task_kind(workspace_id, None, task_kind).await
+    let work_kind = classify_task(title, instruction);
+    route_task_kind(workspace_id, None, work_kind).await
 }
 
 pub async fn get_decision(decision_id: &str) -> anyhow::Result<Option<RouteDecision>> {
@@ -413,11 +459,11 @@ pub async fn list_decisions_for_task(task_id: &str) -> anyhow::Result<Vec<RouteD
 async fn route_task_kind(
     workspace_id: &str,
     task_id: Option<&str>,
-    task_kind: TaskKind,
+    work_kind: WorkKind,
 ) -> anyhow::Result<RouteDecision> {
     seed_default_policies().await?;
 
-    let policy = select_policy(&task_kind).await?;
+    let policy = select_policy(&work_kind).await?;
     let preferred_kind = policy.backend_kind.clone();
     let (backend, selected_kind, backend_fallback) = select_backend(&preferred_kind).await?;
     let profile_id = active_policy_profile_id(&policy).await?;
@@ -434,7 +480,8 @@ async fn route_task_kind(
         id: format!("route-decision-{}", Uuid::new_v4()),
         workspace_id: workspace_id.to_string(),
         task_id: task_id.map(str::to_string),
-        task_kind,
+        work_kind,
+        ooda_phase: None,
         policy_id: Some(policy.id.clone()),
         backend_id: backend.as_ref().map(|b| b.id.clone()),
         backend_kind: selected_kind,
@@ -447,9 +494,10 @@ async fn route_task_kind(
     Ok(decision)
 }
 
-async fn select_policy(task_kind: &TaskKind) -> anyhow::Result<RoutingPolicy> {
+async fn select_policy(work_kind: &WorkKind) -> anyhow::Result<RoutingPolicy> {
     let policies = list_policies(RoutingPolicyFilter {
-        task_kind: Some(task_kind.clone()),
+        work_kind: Some(work_kind.clone()),
+        caller_phase: None,
         enabled: Some(true),
         limit: Some(25),
     })
@@ -458,7 +506,7 @@ async fn select_policy(task_kind: &TaskKind) -> anyhow::Result<RoutingPolicy> {
     policies
         .into_iter()
         .next()
-        .with_context(|| format!("no enabled routing policy for {}", task_kind.as_str()))
+        .with_context(|| format!("no enabled routing policy for {}", work_kind.as_str()))
 }
 
 async fn select_backend(
@@ -534,14 +582,15 @@ async fn insert_policy(policy: &RoutingPolicy) -> anyhow::Result<()> {
     sqlx::query(
         r#"
         INSERT INTO routing_policies (
-            id, task_kind, backend_kind, profile_id, priority, enabled,
+            id, task_kind, caller_phase, backend_kind, profile_id, priority, enabled,
             reason_template, created_at, updated_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
         "#,
     )
     .bind(&policy.id)
-    .bind(policy.task_kind.as_str())
+    .bind(policy.work_kind.as_str())
+    .bind(policy.caller_phase.as_ref().map(|p| p.as_str()))
     .bind(policy.backend_kind.as_str())
     .bind(&policy.profile_id)
     .bind(policy.priority)
@@ -568,7 +617,7 @@ async fn insert_decision(decision: &RouteDecision) -> anyhow::Result<()> {
     .bind(&decision.id)
     .bind(&decision.workspace_id)
     .bind(&decision.task_id)
-    .bind(decision.task_kind.as_str())
+    .bind(decision.work_kind.as_str())
     .bind(&decision.policy_id)
     .bind(&decision.backend_id)
     .bind(decision.backend_kind.as_str())
@@ -584,7 +633,12 @@ async fn insert_decision(decision: &RouteDecision) -> anyhow::Result<()> {
 fn row_to_policy(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<RoutingPolicy> {
     Ok(RoutingPolicy {
         id: row.try_get("id")?,
-        task_kind: TaskKind::from_str(row.try_get::<String, _>("task_kind")?.as_str())?,
+        work_kind: WorkKind::from_str(row.try_get::<String, _>("task_kind")?.as_str())?,
+        caller_phase: row
+            .try_get::<Option<String>, _>("caller_phase")
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str::<OodaPhase>(&format!("\"{}\"", s)).ok()),
         backend_kind: BackendKind::from_str(row.try_get::<String, _>("backend_kind")?.as_str())?,
         profile_id: row.try_get("profile_id")?,
         priority: row.try_get("priority")?,
@@ -600,7 +654,8 @@ fn row_to_decision(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<RouteDecision
         id: row.try_get("id")?,
         workspace_id: row.try_get("workspace_id")?,
         task_id: row.try_get("task_id")?,
-        task_kind: TaskKind::from_str(row.try_get::<String, _>("task_kind")?.as_str())?,
+        work_kind: WorkKind::from_str(row.try_get::<String, _>("task_kind")?.as_str())?,
+        ooda_phase: None,
         policy_id: row.try_get("policy_id")?,
         backend_id: row.try_get("backend_id")?,
         backend_kind: BackendKind::from_str(row.try_get::<String, _>("backend_kind")?.as_str())?,
@@ -646,27 +701,27 @@ mod tests {
     fn classifier_detects_core_task_kinds() {
         assert_eq!(
             classify_task("Implement API endpoint", "write Rust handler"),
-            TaskKind::Coding
+            WorkKind::Coding
         );
         assert_eq!(
             classify_task("Review workspace.md", "produce verdict"),
-            TaskKind::Review
+            WorkKind::Review
         );
         assert_eq!(
             classify_task("Run cargo test", "verify coverage"),
-            TaskKind::Testing
+            WorkKind::Testing
         );
         assert_eq!(
             classify_task("Update README docs", "write markdown"),
-            TaskKind::Document
+            WorkKind::Document
         );
         assert_eq!(
             classify_task("Send Lark notice", "飞书发送消息"),
-            TaskKind::ExternalAction
+            WorkKind::ExternalAction
         );
         assert_eq!(
             classify_task("Plan next wave", "方案拆解"),
-            TaskKind::Planning
+            WorkKind::Planning
         );
     }
 
@@ -688,7 +743,8 @@ mod tests {
 
         let policy = create_policy(CreateRoutingPolicyInput {
             id: None,
-            task_kind: TaskKind::Document,
+            work_kind: WorkKind::Document,
+            caller_phase: None,
             backend_kind: BackendKind::ClaudeP,
             profile_id: Some(profile.id.clone()),
             priority: 10,
@@ -702,7 +758,7 @@ mod tests {
             .await
             .expect("get policy")
             .expect("policy exists");
-        assert_eq!(loaded.task_kind, TaskKind::Document);
+        assert_eq!(loaded.work_kind, WorkKind::Document);
         assert_eq!(loaded.profile_id.as_deref(), Some(profile.id.as_str()));
 
         let updated = update_policy(
@@ -747,11 +803,11 @@ mod tests {
         .expect("list policies");
         assert_eq!(policies.len(), 6);
         assert!(policies.iter().any(|p| {
-            p.task_kind == TaskKind::Coding && p.backend_kind == BackendKind::CodexInteractive
+            p.work_kind == WorkKind::Coding && p.backend_kind == BackendKind::CodexInteractive
         }));
         assert!(policies
             .iter()
-            .any(|p| p.task_kind == TaskKind::Document && p.backend_kind == BackendKind::ClaudeP));
+            .any(|p| p.work_kind == WorkKind::Document && p.backend_kind == BackendKind::ClaudeP));
     }
 
     #[tokio::test]
@@ -768,7 +824,7 @@ mod tests {
         .await
         .expect("route task");
 
-        assert_eq!(decision.task_kind, TaskKind::Coding);
+        assert_eq!(decision.work_kind, WorkKind::Coding);
         assert_eq!(decision.backend_kind, BackendKind::CodexInteractive);
         assert_eq!(decision.backend_id.as_deref(), Some(codex.id.as_str()));
         assert!(!decision.fallback_used);
@@ -790,7 +846,7 @@ mod tests {
             .await
             .expect("route document");
 
-        assert_eq!(decision.task_kind, TaskKind::Document);
+        assert_eq!(decision.work_kind, WorkKind::Document);
         assert_eq!(decision.backend_kind, BackendKind::ClaudeP);
         assert_eq!(decision.backend_id.as_deref(), Some(claude.id.as_str()));
     }
@@ -835,7 +891,7 @@ mod tests {
             .await
             .expect("route coding with fallback");
 
-        assert_eq!(decision.task_kind, TaskKind::Coding);
+        assert_eq!(decision.work_kind, WorkKind::Coding);
         assert_eq!(decision.backend_kind, BackendKind::ClaudeP);
         assert_eq!(decision.backend_id.as_deref(), Some(claude.id.as_str()));
         assert!(decision.fallback_used);

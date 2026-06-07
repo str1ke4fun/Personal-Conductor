@@ -90,6 +90,7 @@ fn default_allowed_tool_ids() -> Vec<String> {
         "file.grep".to_string(),
         "file.read".to_string(),
         "file.write".to_string(),
+        "file.append".to_string(),
         "file.edit".to_string(),
         "file.stat".to_string(),
         "workspace.current".to_string(),
@@ -462,6 +463,19 @@ fn normalize(mut config: CoreConfig) -> CoreConfig {
         .filter(|key| !key.is_empty());
     config.llm.api_key_set = config.llm.api_key.is_some();
     config.llm.temperature = config.llm.temperature.clamp(0.0, 2.0);
+    if config
+        .llm
+        .allowed_tool_ids
+        .iter()
+        .any(|id| id == "file.write")
+        && !config
+            .llm
+            .allowed_tool_ids
+            .iter()
+            .any(|id| id == "file.append")
+    {
+        config.llm.allowed_tool_ids.push("file.append".to_string());
+    }
     if config.reminders.quiet_minutes == 0 {
         config.reminders.quiet_minutes = ReminderConfig::default().quiet_minutes;
     }
@@ -525,5 +539,19 @@ mod tests {
         save(&config).await.expect("save config");
 
         assert_eq!(load().await.expect("load config"), config);
+    }
+
+    #[test]
+    fn normalize_adds_file_append_when_file_write_is_enabled() {
+        let mut config = CoreConfig::default();
+        config.llm.allowed_tool_ids.retain(|id| id != "file.append");
+
+        let normalized = normalize(config);
+
+        assert!(normalized
+            .llm
+            .allowed_tool_ids
+            .iter()
+            .any(|id| id == "file.append"));
     }
 }

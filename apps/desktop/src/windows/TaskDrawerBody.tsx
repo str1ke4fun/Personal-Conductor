@@ -7,6 +7,27 @@ import {
   type Task,
   type WorkspaceActivityProjection,
 } from '../ipc/invoke';
+import { StatusPill, type SignalTone } from './PanelKit';
+
+/** Drawer section using the shared deck section chrome. */
+function PanelSectionLike({
+  title,
+  tone,
+  children,
+}: {
+  title: string;
+  tone?: SignalTone;
+  children: ReactNode;
+}) {
+  return (
+    <section className={`task-drawer-section deck-section ${tone ? `deck-section--${tone}` : ''}`}>
+      <header className="deck-section-head">
+        <h4 className="task-drawer-section-title deck-section-title">{title}</h4>
+      </header>
+      <div className="task-drawer-cards deck-section-body">{children}</div>
+    </section>
+  );
+}
 
 function formatTime(isoString: string): string {
   return new Date(isoString).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -273,77 +294,76 @@ export function TaskDrawerBody(props: BodyProps) {
 
   if (busy.length === 0 && pending.length === 0) {
     return (
-      <div className="task-drawer">
-        <div className="task-drawer-summary">
-          <button className="refresh-btn-small" onClick={() => void onRefresh()} title="刷新">
+      <div className="task-drawer deck-drawer">
+        <div className="task-drawer-summary deck-drawer-summary">
+          <span className="deck-section-title">活动</span>
+          <button className="refresh-btn-small deck-drawer-refresh" onClick={() => void onRefresh()} title="刷新">
             ↻
           </button>
         </div>
-        <div className="empty-state-mini">当前没有后台工作。</div>
+        <div className="empty-state-mini deck-empty">当前没有后台工作。</div>
       </div>
     );
   }
 
   return (
-    <div className="task-drawer">
-      <div className="task-drawer-summary">
-        <span className="task-drawer-stat active">{busy.length} 进行中</span>
-        <span className="task-drawer-stat pending">{pending.length} 待处理</span>
-        <button className="refresh-btn-small" onClick={() => void onRefresh()} title="刷新">
+    <div className="task-drawer deck-drawer">
+      <div className="task-drawer-summary deck-drawer-summary">
+        <StatusPill tone="running" pulse={busy.length > 0}>
+          {busy.length} 进行中
+        </StatusPill>
+        <StatusPill tone="warn">
+          {pending.length} 待处理
+        </StatusPill>
+        <button className="refresh-btn-small deck-drawer-refresh" onClick={() => void onRefresh()} title="刷新">
           ↻
         </button>
       </div>
 
       {busy.length > 0 && (
-        <section className="task-drawer-section">
-          <h4 className="task-drawer-section-title">正在推进 ({busy.length})</h4>
-          <div className="task-drawer-cards">
-            {busy.map((item) => (
-              <div
-                key={item.key}
-                className={`drawer-card-wrapper ${expandedKeys.has(item.key) ? 'expanded' : 'collapsed'}`}
-                onClick={() => toggleExpanded(item.key)}
-                role="button"
-                tabIndex={0}
-                aria-expanded={expandedKeys.has(item.key)}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter' || event.key === ' ') {
-                    event.preventDefault();
-                    toggleExpanded(item.key);
-                  }
-                }}
-              >
-                {renderCard(item, 'busy')}
-              </div>
-            ))}
-          </div>
-        </section>
+        <PanelSectionLike title={`正在推进 (${busy.length})`} tone="running">
+          {busy.map((item) => (
+            <div
+              key={item.key}
+              className={`drawer-card-wrapper ${expandedKeys.has(item.key) ? 'expanded' : 'collapsed'}`}
+              onClick={() => toggleExpanded(item.key)}
+              role="button"
+              tabIndex={0}
+              aria-expanded={expandedKeys.has(item.key)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                  event.preventDefault();
+                  toggleExpanded(item.key);
+                }
+              }}
+            >
+              {renderCard(item, 'busy')}
+            </div>
+          ))}
+        </PanelSectionLike>
       )}
 
       {pending.length > 0 && (
-        <section className="task-drawer-section">
-          <h4 className="task-drawer-section-title">待处理 ({pending.length})</h4>
-          <div className="task-drawer-cards">
-            {pending.map((item) => (
-              <div
-                key={item.key}
-                className={`drawer-card-wrapper ${expandedKeys.has(item.key) ? 'expanded' : 'collapsed'}`}
-                onClick={() => toggleExpanded(item.key)}
-                role="button"
-                tabIndex={0}
-                aria-expanded={expandedKeys.has(item.key)}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter' || event.key === ' ') {
-                    event.preventDefault();
-                    toggleExpanded(item.key);
-                  }
-                }}
-              >
-                {renderCard(item, 'pending')}
-              </div>
-            ))}
-          </div>
-        </section>
+        <PanelSectionLike title={`待处理 (${pending.length})`} tone="warn">
+          {pending.map((item) => (
+            <div
+              key={item.key}
+              className={`drawer-card-wrapper ${expandedKeys.has(item.key) ? 'expanded' : 'collapsed'}`}
+              onClick={() => toggleExpanded(item.key)}
+              role="button"
+              tabIndex={0}
+              aria-expanded={expandedKeys.has(item.key)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                  event.preventDefault();
+                  toggleExpanded(item.key);
+                }
+              }}
+            >
+              {renderCard(item, 'pending')}
+            </div>
+          ))}
+        </PanelSectionLike>
       )}
     </div>
   );

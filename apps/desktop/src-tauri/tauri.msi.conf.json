@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "active": true,
+    "targets": ["msi"],
+    "publisher": "Personal Conductor Co., Ltd.",
+    "homepage": "https://conductor.local/",
+    "shortDescription": "Personal Conductor desktop agent runtime",
+    "longDescription": "Personal Conductor is a local-first Windows desktop agent runtime with goal-driven multi-agent collaboration.",
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      },
+      "wix": {
+        "upgradeCode": "1D628B39-3E70-4BF7-A5DC-DE313F465AEE",
+        "language": ["zh-CN", "en-US"]
+      }
+    }
+  }
+}

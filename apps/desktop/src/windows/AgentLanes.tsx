@@ -56,6 +56,15 @@ const MESSAGE_KIND_LABELS: Record<string, string> = {
   progress_update: '最近进展',
 };
 
+const MEMBER_STATUS_LABEL: Record<string, string> = {
+  idle: '空闲',
+  running: '执行中',
+  completed: '已完成',
+  blocked: '阻塞',
+  failed: '失败',
+  stopped: '已停止',
+};
+
 function readMetadataString(member: AgentTeamMember, key: string): string | null {
   const value = member.metadata_json?.[key];
   return typeof value === 'string' && value.trim() ? value : null;
@@ -75,6 +84,10 @@ function formatExecutorSummary(
   formatElapsed: (createdAt: string) => string,
 ): string {
   const segments: string[] = [];
+
+  // Show member execution status
+  const statusLabel = MEMBER_STATUS_LABEL[member.status] ?? member.status;
+  segments.push(statusLabel);
 
   if (
     member.run_id ||

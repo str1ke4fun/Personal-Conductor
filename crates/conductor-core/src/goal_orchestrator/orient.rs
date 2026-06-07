@@ -152,15 +152,18 @@ mod tests {
                 orientation_json: None,
                 dispatch_plan_id: None,
                 review_summary_ref: None,
+                last_graph_hash: None,
                 started_at: now,
                 updated_at: now,
                 finished_at: None,
             }),
+            facts: vec![],
             active_tasks: tasks,
             heartbeats: vec![],
             active_leases: vec![],
             recent_events: vec![],
             unread_messages: vec![],
+            recent_hints: vec![],
         }
     }
 

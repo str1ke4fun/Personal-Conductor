@@ -74,7 +74,7 @@ function classifyTool(toolName: string, input: Record<string, any>): 'permission
   if (isToolId(toolName, 'bash.execute', 'bash.cancel')) {
     return 'command';
   }
-  if (isToolId(toolName, 'file.write', 'file.edit')) {
+  if (isToolId(toolName, 'file.write', 'file.append', 'file.edit')) {
     return 'permission';
   }
   // If input contains plan-like structure
@@ -158,10 +158,17 @@ export function ContentBlocksRenderer({
   }
   flushRun();
 
+  // Re-order: hoist any text segments that appear between/before tool runs to the end,
+  // so the final assistant text always renders after all tool call cards.
+  // Non-text, non-tool blocks (thinking, plan, completion, etc.) keep their original position.
+  const textSegments = segments.filter(s => s.kind === 'block' && (s as { kind: 'block'; block: ContentBlock; index: number }).block.type === 'text');
+  const nonTextSegments = segments.filter(s => !(s.kind === 'block' && (s as { kind: 'block'; block: ContentBlock; index: number }).block.type === 'text'));
+  const orderedSegments = [...nonTextSegments, ...textSegments];
+
   // Render each segment
   return (
     <>
-      {segments.map((seg, si) => {
+      {orderedSegments.map((seg, si) => {
         if (seg.kind === 'block') {
           const block = seg.block;
           if (block.type === 'thinking') {
@@ -429,14 +436,13 @@ function RuntimeStatusBar({ turnStartedAt, currentPhase, toolRunCount, activeToo
         <span className="runtime-status-dot" />
         正在推进 {formatElapsed(elapsed)}
       </span>
-      {phaseLabel && (
+      {phaseLabel ? (
         <span className="runtime-status-phase">{phaseLabel}</span>
-      )}
-      {toolRunCount > 0 && (
+      ) : toolRunCount > 0 ? (
         <span className="runtime-status-tools">
           已调用 {toolRunCount} 次工具{activeToolCount > 0 ? ` (${activeToolCount} 个仍在运行)` : ''}
         </span>
-      )}
+      ) : null}
     </div>
   );
 }
@@ -449,7 +455,6 @@ function EmptyTimelineState() {
       <ul className="chat-empty-hints">
         <li>描述一个问题，或者贴段代码</li>
         <li>切到目标模式，交给她执行一个长任务</li>
-        <li>不知道说什么，就说「现在在做什么」</li>
       </ul>
     </div>
   );
@@ -501,25 +506,34 @@ function LiveRunBlock({
         ) : null}
         {toolStates.size > 0 && (
           <div className="stream-tools">
-            {Array.from(toolStates.values()).map((ts) => {
-              const toolCategory = classifyTool(ts.tool_name, ts.input ?? {});
+            {(() => {
+              const prominent: StreamToolState[] = [];
+              const generic: StreamToolState[] = [];
+              toolStates.forEach((ts) => {
+                const cat = classifyTool(ts.tool_name, ts.input ?? {});
+                if (cat === 'command' || cat === 'permission' || isPermissionStatus(ts.status)) {
+                  prominent.push(ts);
+                } else {
+                  generic.push(ts);
+                }
+              });
 
-              if (toolCategory === 'command') {
-                return (
-                  <CommandRunCard
-                    key={ts.tool_use_id}
-                    command={ts.input?.command ?? ''}
-                    cwd={ts.input?.cwd}
-                    status={ts.status}
-                    stdout={ts.result?.stdout}
-                    stderr={ts.result?.stderr ?? ts.result?.error}
-                    exitCode={ts.result?.exit_code}
-                    durationMs={ts.duration_ms}
-                  />
-                );
-              }
-
-              if (toolCategory === 'permission' || isPermissionStatus(ts.status)) {
+              const prominentNodes = prominent.map((ts) => {
+                const cat = classifyTool(ts.tool_name, ts.input ?? {});
+                if (cat === 'command') {
+                  return (
+                    <CommandRunCard
+                      key={ts.tool_use_id}
+                      command={ts.input?.command ?? ''}
+                      cwd={ts.input?.cwd}
+                      status={ts.status}
+                      stdout={ts.result?.stdout}
+                      stderr={ts.result?.stderr ?? ts.result?.error}
+                      exitCode={ts.result?.exit_code}
+                      durationMs={ts.duration_ms}
+                    />
+                  );
+                }
                 return (
                   <PermissionCard
                     key={ts.tool_use_id}
@@ -532,22 +546,35 @@ function LiveRunBlock({
                     onReject={onRejectProposal}
                   />
                 );
-              }
+              });
 
-              return (
-                <ToolUseCard
-                  key={ts.tool_use_id}
-                  toolId={ts.tool_name}
-                  input={ts.input ?? {}}
-                  status={ts.status}
-                  result={ts.result}
-                  durationMs={ts.duration_ms}
-                  proposalId={ts.proposal_id}
-                  onApprove={onApproveProposal}
-                  onReject={onRejectProposal}
-                />
-              );
-            })}
+              // Aggregate generic tools when there are enough, same as persisted logic
+              const genericNodes = generic.length >= AGGREGATION_THRESHOLD
+                ? (
+                    <ToolRunSummary
+                      key="generic-agg"
+                      toolStates={generic}
+                      mode="live"
+                      onApprove={onApproveProposal}
+                      onReject={onRejectProposal}
+                    />
+                  )
+                : generic.map((ts) => (
+                    <ToolUseCard
+                      key={ts.tool_use_id}
+                      toolId={ts.tool_name}
+                      input={ts.input ?? {}}
+                      status={ts.status}
+                      result={ts.result}
+                      durationMs={ts.duration_ms}
+                      proposalId={ts.proposal_id}
+                      onApprove={onApproveProposal}
+                      onReject={onRejectProposal}
+                    />
+                  ));
+
+              return <>{prominentNodes}{genericNodes}</>;
+            })()}
           </div>
         )}
         {streamTokens.length > 0 && (
@@ -734,80 +761,6 @@ export function ChatTimelinePane({
           onApproveProposal={onApproveProposal}
           onRejectProposal={onRejectProposal}
         />
-      )}
-      {false && sending && (
-        <div className="chat-message chat-assistant">
-          {(thinkingContent ?? '').length > 0 ? (
-            <ThinkingBlock thinking={thinkingContent ?? ''} />
-          ) : null}
-          {toolStates.size > 0 && (
-            <div className="stream-tools">
-              {Array.from(toolStates.values()).map((ts) => {
-                const toolCategory = classifyTool(ts.tool_name, ts.input ?? {});
-
-                if (toolCategory === 'command') {
-                  return (
-                    <CommandRunCard
-                      key={ts.tool_use_id}
-                      command={ts.input?.command ?? ''}
-                      cwd={ts.input?.cwd}
-                      status={ts.status}
-                      stdout={ts.result?.stdout}
-                      stderr={ts.result?.stderr ?? ts.result?.error}
-                      exitCode={ts.result?.exit_code}
-                      durationMs={ts.duration_ms}
-                    />
-                  );
-                }
-
-                if (toolCategory === 'permission' || isPermissionStatus(ts.status)) {
-                  return (
-                    <PermissionCard
-                      key={ts.tool_use_id}
-                      toolName={normalizeToolId(ts.tool_name)}
-                      summary={ts.input?.path ?? ts.input?.file_path ?? ''}
-                      detail={JSON.stringify(ts.input, null, 2)}
-                      status={ts.status}
-                      proposalId={ts.proposal_id}
-                      onApprove={onApproveProposal}
-                      onReject={onRejectProposal}
-                    />
-                  );
-                }
-
-                return (
-                  <ToolUseCard
-                    key={ts.tool_use_id}
-                    toolId={ts.tool_name}
-                    input={ts.input ?? {}}
-                    status={ts.status}
-                    result={ts.result}
-                    durationMs={ts.duration_ms}
-                    proposalId={ts.proposal_id}
-                    onApprove={onApproveProposal}
-                    onReject={onRejectProposal}
-                  />
-                );
-              })}
-            </div>
-          )}
-          {streamTokens.length > 0 && (
-            <div className="chat-message-content chat-stream-content">
-              <MarkdownRenderer content={streamTokens.join('')} />
-            </div>
-          )}
-          {typeof turnStartedAt === 'number' && (
-            <RuntimeStatusBar
-              turnStartedAt={turnStartedAt ?? 0}
-              currentPhase={currentPhase ?? null}
-              toolRunCount={toolRunCount ?? 0}
-              activeToolCount={activeToolCount ?? 0}
-            />
-          )}
-          {!thinkingContent && toolStates.size === 0 && streamTokens.length === 0 && !turnStartedAt && (
-            <div className="chat-message-typing">稍等...</div>
-          )}
-        </div>
       )}
       <div ref={endRef as any} />
     </div>

@@ -1,10 +1,11 @@
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { open } from '@tauri-apps/plugin-dialog';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, appendGoalUserMessage, approveGoalPlan, createGoal, listGoals, resumeGoal, updateGoalObjective, updateGoalStatus, type ChatSessionSummary, type GoalRun, type Workspace, type WorkspaceStatus } from '../ipc/invoke';
+import { api, appendGoalUserMessage, approveGoalPlan, createGoal, getGoalGraph, listGoals, resumeGoal, updateGoalObjective, updateGoalStatus, type ChatSessionSummary, type GoalGraphSnapshot, type GoalRun, type Workspace, type WorkspaceStatus } from '../ipc/invoke';
 import { ChatComposer } from './ChatComposer';
 import { ChatSessionSidebar } from './ChatSessionSidebar';
 import { ChatTimelinePane } from './ChatTimelinePane';
+import { CycleIndicator } from './CycleIndicator';
 import GoalConsole from './GoalConsole';
 import { TaskDrawerPane } from './TaskDrawerPane';
 import { useChatSession } from './useChatSession';
@@ -90,8 +91,16 @@ export function AgentWorkspacePanel() {
   const [workspaceStatus, setWorkspaceStatus] = useState<WorkspaceStatus | null>(null);
   const [attaching, setAttaching] = useState(false);
   const [activeGoal, setActiveGoal] = useState<GoalRun | null>(null);
+  const [goalGraph, setGoalGraph] = useState<GoalGraphSnapshot | null>(null);
   const [themeMode, setThemeMode] = useState<ThemeMode>(getInitialTheme);
   const autoApprovedGoalIdRef = useRef<string | null>(null);
+  // Updated on every render so handleSend always sees the latest chat state
+  // without requiring chat as a useCallback dependency.
+  const chatRef = useRef<typeof chat | null>(null);
+  // Tracks optimistic session_kind changes that are in-flight to the backend.
+  // Prevents stale sidebar refreshes (started before the mode switch) from
+  // clobbering the optimistic update and causing a double-mount of GoalConsole.
+  const pendingKindUpdates = useRef<Map<string, string>>(new Map());
   const appWindow = getCurrentWindow();
 
   useEffect(() => {
@@ -124,6 +133,7 @@ export function AgentWorkspacePanel() {
     workspaceId: activeWorkspaceId,
     onSessionCreated: setActiveSessionId,
   });
+  chatRef.current = chat;
 
   const recentWorkspaces = useMemo(
     () =>
@@ -158,11 +168,37 @@ export function AgentWorkspacePanel() {
   const refreshSessions = useCallback(async () => {
     try {
       const updated = await api.listChatSessions(20);
-      setSessions(updated);
+      // Apply the same pending-kind guard as handleSessionsLoaded so that an
+      // in-flight mode switch isn't clobbered even by our own refresh.
+      const pending = pendingKindUpdates.current;
+      setSessions(
+        pending.size === 0
+          ? updated
+          : updated.map((s) => {
+              const pk = pending.get(s.id);
+              return pk ? { ...s, session_kind: pk as 'chat' | 'goal' } : s;
+            }),
+      );
       return updated;
     } catch {
       return null;
     }
+  }, []);
+
+  // Smart merge: applies fresh session data but preserves any session_kind values
+  // that are currently being optimistically updated (mode switch in flight).
+  const handleSessionsLoaded = useCallback((freshSessions: ChatSessionSummary[]) => {
+    const pending = pendingKindUpdates.current;
+    if (pending.size === 0) {
+      setSessions(freshSessions);
+      return;
+    }
+    setSessions(
+      freshSessions.map((s) => {
+        const pendingKind = pending.get(s.id);
+        return pendingKind ? { ...s, session_kind: pendingKind as 'chat' | 'goal' } : s;
+      }),
+    );
   }, []);
 
   const createGoalFromInput = useCallback(
@@ -232,24 +268,42 @@ export function AgentWorkspacePanel() {
     return () => window.clearInterval(id);
   }, [activeSession?.goal_id, activeWorkspaceId, activeGoal?.status]);
 
+  // Fetch and poll the goal reasoning graph for the status bar summary.
   useEffect(() => {
-    if (sessionKind !== 'goal' || !activeWorkspaceId || !activeGoal || activeGoal.status !== 'awaiting_plan_approval') {
-      if (!activeGoal || activeGoal.status !== 'awaiting_plan_approval') {
+    const goalId = activeSession?.goal_id;
+    if (!goalId || sessionKind !== 'goal') {
+      setGoalGraph(null);
+      return;
+    }
+    const refresh = () => {
+      getGoalGraph(goalId).then(setGoalGraph).catch(() => {});
+    };
+    refresh();
+    const id = window.setInterval(refresh, 8000);
+    return () => window.clearInterval(id);
+  }, [activeSession?.goal_id, sessionKind]);
+
+  useEffect(() => {
+    const goalId = activeGoal?.id;
+    const goalStatus = activeGoal?.status;
+    if (sessionKind !== 'goal' || !activeWorkspaceId || !goalId || goalStatus !== 'awaiting_plan_approval') {
+      if (!goalId || goalStatus !== 'awaiting_plan_approval') {
         autoApprovedGoalIdRef.current = null;
       }
       return;
     }
 
-    if (autoApprovedGoalIdRef.current === activeGoal.id) return;
-    autoApprovedGoalIdRef.current = activeGoal.id;
+    if (autoApprovedGoalIdRef.current === goalId) return;
+    autoApprovedGoalIdRef.current = goalId;
 
-    approveGoalPlan(activeGoal.id)
+    approveGoalPlan(goalId)
       .then((goal) => setActiveGoal(goal))
       .catch((error) => {
         autoApprovedGoalIdRef.current = null;
         console.error('Failed to auto-approve legacy goal plan:', error);
       });
-  }, [sessionKind, activeWorkspaceId, activeGoal]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionKind, activeWorkspaceId, activeGoal?.id, activeGoal?.status]);
 
   useEffect(() => {
     if (!activeWorkspaceId) {
@@ -298,12 +352,8 @@ export function AgentWorkspacePanel() {
 
     const normalized = workspaceId || null;
     await api.updateChatSessionWorkspace(activeSessionId, normalized ?? undefined);
-    setSessions((current) =>
-      current.map((session) =>
-        session.id === activeSessionId ? { ...session, workspace_id: normalized } : session,
-      ),
-    );
     await refreshWorkspaces();
+    await refreshSessions();
   }
 
   async function handleFolderPicker() {
@@ -320,12 +370,8 @@ export function AgentWorkspacePanel() {
       const root = typeof selected === 'string' ? selected : selected;
       const workspace = await api.attachWorkspace(root);
       await api.updateChatSessionWorkspace(activeSessionId, workspace.id);
-      setSessions((current) =>
-        current.map((session) =>
-          session.id === activeSessionId ? { ...session, workspace_id: workspace.id } : session,
-        ),
-      );
       await refreshWorkspaces();
+      await refreshSessions();
     } catch (error) {
       console.error('Failed to attach workspace:', error);
     } finally {
@@ -382,20 +428,40 @@ export function AgentWorkspacePanel() {
   const handleSwitchKind = useCallback(
     async (kind: SessionKind) => {
       if (!activeSessionId || sessionKind === kind) return;
-      // Preserve goal_id when switching kind — don't overwrite it with null.
+      const sid = activeSessionId;
       const existingGoalId = activeSession?.goal_id ?? null;
+      // Guard: prevent stale sidebar refreshes (in-flight before this switch)
+      // from clobbering the optimistic update with old session_kind data.
+      pendingKindUpdates.current.set(sid, kind);
       setSessions((current) =>
         current.map((session) =>
-          session.id === activeSessionId ? { ...session, session_kind: kind } : session,
+          session.id === sid ? { ...session, session_kind: kind } : session,
         ),
       );
+
+      let apiSucceeded = false;
       try {
-        await api.setChatSessionKind(activeSessionId, kind, existingGoalId);
+        await api.setChatSessionKind(sid, kind, existingGoalId);
+        apiSucceeded = true;
       } catch (error) {
         console.error('Failed to switch session kind:', error);
       }
+
+      if (!apiSucceeded) {
+        // API failed: clear the guard before refreshing so the refresh shows
+        // the actual (reverted) backend state.
+        pendingKindUpdates.current.delete(sid);
+      }
+
+      await refreshSessions();
+
+      if (apiSucceeded) {
+        // Success: clear the guard after refresh (the guard kept GoalConsole
+        // alive during the refresh if backend data lacked session_kind yet).
+        pendingKindUpdates.current.delete(sid);
+      }
     },
-    [activeSessionId, sessionKind, activeSession],
+    [activeSessionId, sessionKind, activeSession, refreshSessions],
   );
 
   // In goal mode, the first message from the user becomes the goal objective.
@@ -405,8 +471,11 @@ export function AgentWorkspacePanel() {
   // Follow-up input can resume or retarget the active goal before we fall back
   // to a foreground long-task turn.
   const handleSend = useCallback(
-    async (options: Parameters<typeof chat.sendMessage>[0]) => {
-      const trimmedInput = chat.input.trim();
+    async (options: Parameters<ReturnType<typeof useChatSession>['sendMessage']>[0]) => {
+      // Always read from the ref so we get the latest input/functions without
+      // adding the entire chat object to the dependency array.
+      const c = chatRef.current!;
+      const trimmedInput = c.input.trim();
 
       if (sessionKind === 'goal' && !activeSession?.goal_id && activeWorkspaceId && trimmedInput) {
         try {
@@ -415,7 +484,7 @@ export function AgentWorkspacePanel() {
           console.error('Failed to create goal from first message:', err);
         }
         // Clear the composer and stop here — the orchestrator owns execution now.
-        chat.setInput('');
+        c.setInput('');
         return;
       }
 
@@ -427,7 +496,7 @@ export function AgentWorkspacePanel() {
           } catch (err) {
             console.error('Failed to create follow-up goal from terminal session:', err);
           }
-          chat.setInput('');
+          c.setInput('');
           return;
         }
         const objectiveOverride = extractGoalObjectiveOverride(trimmedInput);
@@ -451,7 +520,7 @@ export function AgentWorkspacePanel() {
           } catch (err) {
             console.error('Failed to update goal objective:', err);
           }
-          chat.setInput('');
+          c.setInput('');
           return;
         }
 
@@ -469,7 +538,7 @@ export function AgentWorkspacePanel() {
           console.error('Failed to append goal follow-up input:', err);
         }
         if (!activeGoal || !GOAL_TERMINAL_STATUSES.has(activeGoal.status)) {
-          chat.setInput('');
+          c.setInput('');
           return;
         }
       }
@@ -478,9 +547,9 @@ export function AgentWorkspacePanel() {
       const goalOptions = sessionKind === 'goal'
         ? { ...options, taskMode: 'long' as const }
         : options;
-      return chat.sendMessage(goalOptions);
+      return c.sendMessage(goalOptions);
     },
-    [sessionKind, activeSession, activeWorkspaceId, activeSessionId, activeGoal?.status, chat, createGoalFromInput, refreshSessions],
+    [sessionKind, activeSession?.goal_id, activeWorkspaceId, activeSessionId, activeGoal, createGoalFromInput, refreshSessions],
   );
 
   return (
@@ -503,7 +572,7 @@ export function AgentWorkspacePanel() {
               activeSessionId={activeSessionId}
               onSelectSession={handleSelectSession}
               currentWorkspaceId={activeWorkspaceId}
-              onSessionsLoaded={setSessions}
+              onSessionsLoaded={handleSessionsLoaded}
             />
           </div>
         )}
@@ -628,7 +697,7 @@ export function AgentWorkspacePanel() {
                 <span className={`goal-status-bar-status goal-status-${activeGoal.status}`}>
                   {GOAL_STATUS_LABELS[activeGoal.status] ?? activeGoal.status}
                 </span>
-                {false && activeGoal?.status === 'awaiting_plan_approval' && (
+                {activeGoal?.status === 'awaiting_plan_approval' && (
                   <button
                     className="goal-status-bar-btn"
                     onClick={() => {
@@ -642,6 +711,25 @@ export function AgentWorkspacePanel() {
                   </button>
                 )}
               </>
+            )}
+            {activeSession?.goal_id && (
+              <div style={{ position: 'relative', flexShrink: 0 }}>
+                <CycleIndicator goalId={activeSession.goal_id} />
+              </div>
+            )}
+            {goalGraph && (
+              <div className="goal-status-bar-graph">
+                <span className="goal-graph-chip">事实 {goalGraph.facts_count}</span>
+                <span className="goal-graph-chip">意图 {goalGraph.open_intents_count}</span>
+                {goalGraph.hints.length > 0 && (
+                  <span className="goal-graph-chip goal-graph-chip--hint">提示 {goalGraph.hints.length}</span>
+                )}
+                {goalGraph.graph_hash && (
+                  <span className="goal-graph-chip goal-graph-chip--hash" title={goalGraph.graph_hash}>
+                    #{goalGraph.graph_hash.slice(0, 6)}
+                  </span>
+                )}
+              </div>
             )}
           </div>
         )}

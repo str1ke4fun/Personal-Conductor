@@ -14,6 +14,8 @@ pub enum BackendKind {
     CodexInteractive,
     AgentTeam,
     Review,
+    /// D-3: Routes via the model-router-mcp server instead of a local CLI.
+    McpRouter,
 }
 
 impl BackendKind {
@@ -23,6 +25,7 @@ impl BackendKind {
             Self::CodexInteractive => "codex_interactive",
             Self::AgentTeam => "agent_team",
             Self::Review => "review",
+            Self::McpRouter => "mcp_router",
         }
     }
 
@@ -32,6 +35,7 @@ impl BackendKind {
             "codex_interactive" => Ok(Self::CodexInteractive),
             "agent_team" => Ok(Self::AgentTeam),
             "review" => Ok(Self::Review),
+            "mcp_router" => Ok(Self::McpRouter),
             other => bail!("unknown backend kind: {other}"),
         }
     }

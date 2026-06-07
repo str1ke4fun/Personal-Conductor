@@ -5,7 +5,10 @@ use serde_json::json;
 use std::{collections::BTreeMap, time::Duration};
 use tokio::time::timeout;
 
-const DEFAULT_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 90;
+const DEFAULT_TEXT_MAX_TOKENS: u32 = 2_000;
+const DEFAULT_TOOL_MAX_TOKENS: u32 = 6_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LlmProtocol {
@@ -58,6 +61,25 @@ impl<'a> LlmRequestConfig<'a> {
             base_url: &config.base_url,
             api_key: config.api_key.as_deref(),
             temperature: config.temperature,
+            tool_choice: None,
+        }
+    }
+
+    /// Build from a resolved model, falling back to global config for fields
+    /// not present in the profile (e.g. when no profile was matched).
+    pub fn from_resolved_with_fallback(
+        resolved: &'a crate::model_resolver::ResolvedModel,
+        fallback: &'a LlmConfig,
+    ) -> Self {
+        Self {
+            provider: resolved.provider.as_deref().unwrap_or(&fallback.provider),
+            model: &resolved.model_id,
+            base_url: resolved
+                .api_base_url
+                .as_deref()
+                .unwrap_or(&fallback.base_url),
+            api_key: resolved.api_key.as_deref().or(fallback.api_key.as_deref()),
+            temperature: resolved.temperature.unwrap_or(fallback.temperature),
             tool_choice: None,
         }
     }
@@ -178,17 +200,7 @@ struct OpenaiResponseMessage {
 
 #[derive(Deserialize)]
 struct AnthropicResponse {
-    content: Vec<AnthropicContentBlock>,
-}
-
-#[derive(Deserialize)]
-struct AnthropicContentBlock {
-    #[serde(rename = "type")]
-    block_type: String,
-    text: Option<String>,
-    id: Option<String>,
-    name: Option<String>,
-    input: Option<serde_json::Value>,
+    content: Vec<serde_json::Value>,
 }
 
 pub async fn call(
@@ -197,18 +209,28 @@ pub async fn call(
     user: &str,
     config: &LlmRequestConfig<'_>,
 ) -> anyhow::Result<String> {
+    call_with_max_tokens(model, system, user, config, DEFAULT_TEXT_MAX_TOKENS).await
+}
+
+pub async fn call_with_max_tokens(
+    model: &str,
+    system: &str,
+    user: &str,
+    config: &LlmRequestConfig<'_>,
+    max_tokens: u32,
+) -> anyhow::Result<String> {
     let client = build_client()?;
     match protocol(config) {
         LlmProtocol::OpenAiCompatible => {
             let url = build_openai_chat_url(config)?;
-            let request = build_openai_request(model, system, user, config);
+            let request = build_openai_request(model, system, user, config, max_tokens);
             let response =
                 execute_openai_with_timeout(client, url, request, config.api_key).await?;
             parse_openai_response(response).await
         }
         LlmProtocol::AnthropicCompatible => {
             let url = build_anthropic_messages_url(config)?;
-            let request = build_anthropic_request(model, system, user, config);
+            let request = build_anthropic_request(model, system, user, config, max_tokens);
             let response =
                 execute_anthropic_with_timeout(client, url, request, config.api_key).await?;
             parse_anthropic_response(response).await
@@ -248,6 +270,23 @@ pub async fn call_with_tools_with_messages(
     config: &LlmRequestConfig<'_>,
     tools: Option<Vec<ToolDefinition>>,
 ) -> anyhow::Result<LlmResponse> {
+    call_with_tools_with_messages_max_tokens(
+        model,
+        messages,
+        config,
+        tools,
+        DEFAULT_TOOL_MAX_TOKENS,
+    )
+    .await
+}
+
+pub async fn call_with_tools_with_messages_max_tokens(
+    model: &str,
+    messages: &[OpenaiMessage],
+    config: &LlmRequestConfig<'_>,
+    tools: Option<Vec<ToolDefinition>>,
+    max_tokens: u32,
+) -> anyhow::Result<LlmResponse> {
     let client = build_client()?;
     match protocol(config) {
         LlmProtocol::OpenAiCompatible => {
@@ -256,7 +295,7 @@ pub async fn call_with_tools_with_messages(
                 model: model.to_string(),
                 messages: messages.to_vec(),
                 temperature: config.temperature,
-                max_tokens: 1500,
+                max_tokens,
                 tools,
                 tool_choice: config.tool_choice.clone(),
                 stream: None,
@@ -268,7 +307,7 @@ pub async fn call_with_tools_with_messages(
         LlmProtocol::AnthropicCompatible => {
             let url = build_anthropic_messages_url(config)?;
             let request =
-                build_anthropic_request_from_messages(model, messages, config, tools, 1500)?;
+                build_anthropic_request_from_messages(model, messages, config, tools, max_tokens)?;
             let response =
                 execute_anthropic_with_timeout(client, url, request, config.api_key).await?;
             parse_anthropic_response_with_tools(response).await
@@ -295,7 +334,7 @@ where
                 model: model.to_string(),
                 messages: messages.to_vec(),
                 temperature: config.temperature,
-                max_tokens: 1500,
+                max_tokens: DEFAULT_TOOL_MAX_TOKENS,
                 tools,
                 tool_choice: config.tool_choice.clone(),
                 stream: Some(true),
@@ -311,8 +350,13 @@ where
         }
         LlmProtocol::AnthropicCompatible => {
             let url = build_anthropic_messages_url(config)?;
-            let mut request =
-                build_anthropic_request_from_messages(model, messages, config, tools, 1500)?;
+            let mut request = build_anthropic_request_from_messages(
+                model,
+                messages,
+                config,
+                tools,
+                DEFAULT_TOOL_MAX_TOKENS,
+            )?;
             request.stream = Some(true);
             execute_anthropic_streaming_with_timeout(
                 client,
@@ -398,14 +442,15 @@ fn join_endpoint(base_without_query: &str, endpoint: &str, query: Option<&str>) 
 
 fn build_client() -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+        .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS))
         .build()
         .context("failed to build HTTP client")
 }
 
 fn build_streaming_client() -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+        .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
         .build()
         .context("failed to build streaming HTTP client")
 }
@@ -415,6 +460,7 @@ fn build_openai_request<'a>(
     system: &'a str,
     user: &'a str,
     config: &'a LlmRequestConfig<'_>,
+    max_tokens: u32,
 ) -> OpenaiRequest {
     OpenaiRequest {
         model: model.to_string(),
@@ -433,7 +479,7 @@ fn build_openai_request<'a>(
             },
         ],
         temperature: config.temperature,
-        max_tokens: 500,
+        max_tokens,
         tools: None,
         tool_choice: None,
         stream: None,
@@ -464,7 +510,7 @@ fn build_openai_request_with_tools(
             },
         ],
         temperature: config.temperature,
-        max_tokens: 1500,
+        max_tokens: DEFAULT_TOOL_MAX_TOKENS,
         tools,
         tool_choice: config.tool_choice.clone(),
         stream: None,
@@ -476,10 +522,11 @@ fn build_anthropic_request(
     system: &str,
     user: &str,
     config: &LlmRequestConfig<'_>,
+    max_tokens: u32,
 ) -> AnthropicRequest {
     AnthropicRequest {
         model: model.to_string(),
-        max_tokens: 500,
+        max_tokens,
         temperature: config.temperature,
         system: non_empty_string(system),
         messages: vec![AnthropicMessage {
@@ -501,7 +548,7 @@ fn build_anthropic_request_with_tools(
 ) -> AnthropicRequest {
     AnthropicRequest {
         model: model.to_string(),
-        max_tokens: 1500,
+        max_tokens: DEFAULT_TOOL_MAX_TOKENS,
         temperature: config.temperature,
         system: non_empty_string(system),
         messages: vec![AnthropicMessage {
@@ -961,9 +1008,10 @@ where
 async fn execute_request_raw(
     req_builder: reqwest::RequestBuilder,
 ) -> anyhow::Result<Result<String, LlmHttpError>> {
-    let response = timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS), async move {
-        req_builder.send().await
-    })
+    let response = timeout(
+        Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
+        async move { req_builder.send().await },
+    )
     .await
     .context("LLM request timed out")?
     .context("LLM request failed")?;
@@ -986,9 +1034,10 @@ async fn execute_request_raw(
 async fn execute_streaming_request_raw(
     req_builder: reqwest::RequestBuilder,
 ) -> anyhow::Result<Result<reqwest::Response, LlmHttpError>> {
-    let response = timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS), async move {
-        req_builder.send().await
-    })
+    let response = timeout(
+        Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
+        async move { req_builder.send().await },
+    )
     .await
     .context("LLM stream request timed out")?
     .context("LLM stream request failed")?;
@@ -1274,10 +1323,13 @@ where
     let mut buffer = Vec::new();
 
     loop {
-        let chunk = timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS), response.chunk())
-            .await
-            .context("LLM stream chunk timed out")?
-            .context("failed to read LLM stream chunk")?;
+        let chunk = timeout(
+            Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
+            response.chunk(),
+        )
+        .await
+        .context("LLM stream chunk timed out")?
+        .context("failed to read LLM stream chunk")?;
         let Some(chunk) = chunk else {
             break;
         };
@@ -1537,7 +1589,19 @@ where
             if let Some(name) = json_str(block_value, "name") {
                 block.name = Some(name.to_string());
             }
-            if let Some(text) = json_str(block_value, "text") {
+            if anthropic_block_is_text(block.block_type.as_str()) {
+                if let Some(text) = anthropic_text_value(block_value) {
+                    block.text.push_str(text);
+                    state.content.push_str(text);
+                    on_event(LlmStreamEvent::Text(text.to_string()));
+                }
+            } else if anthropic_block_is_reasoning(block.block_type.as_str()) {
+                if let Some(thinking) = anthropic_reasoning_value(block_value) {
+                    block.text.push_str(thinking);
+                    state.reasoning_content.push_str(thinking);
+                    on_event(LlmStreamEvent::Reasoning(thinking.to_string()));
+                }
+            } else if let Some(text) = json_str(block_value, "text") {
                 block.text.push_str(text);
                 state.content.push_str(text);
                 on_event(LlmStreamEvent::Text(text.to_string()));
@@ -1548,15 +1612,15 @@ where
             let delta = value.get("delta").unwrap_or(&serde_json::Value::Null);
             let block = state.blocks.entry(index).or_default();
             match json_str(delta, "type").unwrap_or_default() {
-                "text_delta" => {
-                    if let Some(text) = json_str(delta, "text") {
+                delta_type if anthropic_delta_is_text(delta_type) => {
+                    if let Some(text) = anthropic_text_value(delta) {
                         block.text.push_str(text);
                         state.content.push_str(text);
                         on_event(LlmStreamEvent::Text(text.to_string()));
                     }
                 }
-                "thinking_delta" => {
-                    if let Some(thinking) = json_str(delta, "thinking") {
+                delta_type if anthropic_delta_is_reasoning(delta_type) => {
+                    if let Some(thinking) = anthropic_reasoning_value(delta) {
                         block.text.push_str(thinking);
                         state.reasoning_content.push_str(thinking);
                         on_event(LlmStreamEvent::Reasoning(thinking.to_string()));
@@ -1588,7 +1652,7 @@ fn anthropic_stream_tool_calls(
 ) -> anyhow::Result<Option<Vec<ToolCall>>> {
     let mut calls = Vec::new();
     for (index, block) in blocks {
-        if block.block_type != "tool_use" {
+        if !anthropic_block_is_tool_use(block.block_type.as_str()) {
             continue;
         }
         let id = block
@@ -1627,6 +1691,40 @@ fn non_empty_json(value: String) -> String {
     } else {
         value
     }
+}
+
+fn anthropic_block_type(value: &serde_json::Value) -> &str {
+    json_str(value, "type").unwrap_or_default()
+}
+
+fn anthropic_block_is_text(block_type: &str) -> bool {
+    matches!(block_type, "text" | "output_text")
+}
+
+fn anthropic_block_is_reasoning(block_type: &str) -> bool {
+    matches!(block_type, "thinking" | "reasoning" | "redacted_thinking")
+}
+
+fn anthropic_block_is_tool_use(block_type: &str) -> bool {
+    block_type == "tool_use"
+}
+
+fn anthropic_delta_is_text(delta_type: &str) -> bool {
+    matches!(delta_type, "text_delta" | "output_text_delta")
+}
+
+fn anthropic_delta_is_reasoning(delta_type: &str) -> bool {
+    matches!(delta_type, "thinking_delta" | "reasoning_delta")
+}
+
+fn anthropic_text_value<'a>(value: &'a serde_json::Value) -> Option<&'a str> {
+    json_str(value, "text").or_else(|| json_str(value, "partial_text"))
+}
+
+fn anthropic_reasoning_value<'a>(value: &'a serde_json::Value) -> Option<&'a str> {
+    json_str(value, "thinking")
+        .or_else(|| json_str(value, "reasoning"))
+        .or_else(|| json_str(value, "text"))
 }
 
 async fn parse_openai_response(response_text: String) -> anyhow::Result<String> {
@@ -1692,27 +1790,31 @@ async fn parse_anthropic_response_with_tools(response_text: String) -> anyhow::R
     let mut thinking_parts = Vec::new();
 
     for block in response.content {
-        match block.block_type.as_str() {
-            "text" => {
-                if let Some(text) = block.text {
-                    text_parts.push(text);
+        match anthropic_block_type(&block) {
+            block_type if anthropic_block_is_text(block_type) => {
+                if let Some(text) = anthropic_text_value(&block) {
+                    text_parts.push(text.to_string());
                 }
             }
-            "thinking" => {
-                if let Some(thinking) = block.text {
-                    thinking_parts.push(thinking);
+            block_type if anthropic_block_is_reasoning(block_type) => {
+                if let Some(thinking) = anthropic_reasoning_value(&block) {
+                    thinking_parts.push(thinking.to_string());
                 }
             }
-            "tool_use" => {
-                let id = block.id.context("Anthropic tool_use block missing id")?;
-                let name = block
-                    .name
-                    .context("Anthropic tool_use block missing name")?;
-                let arguments = serde_json::to_string(&block.input.unwrap_or_else(|| json!({})))?;
+            block_type if anthropic_block_is_tool_use(block_type) => {
+                let id = json_str(&block, "id").context("Anthropic tool_use block missing id")?;
+                let name =
+                    json_str(&block, "name").context("Anthropic tool_use block missing name")?;
+                let arguments = serde_json::to_string(
+                    &block.get("input").cloned().unwrap_or_else(|| json!({})),
+                )?;
                 tool_calls.push(ToolCall {
-                    id,
+                    id: id.to_string(),
                     call_type: "function".to_string(),
-                    function: ToolCallFunction { name, arguments },
+                    function: ToolCallFunction {
+                        name: name.to_string(),
+                        arguments,
+                    },
                 });
             }
             _ => {}
@@ -1853,12 +1955,13 @@ mod tests {
             "system",
             "user",
             &config("openai_compatible", "https://api.example.com/v1"),
+            DEFAULT_TEXT_MAX_TOKENS,
         );
         let body = openai_request_body(&request, TokenLimitField::MaxCompletionTokens).unwrap();
         assert!(body.get("max_tokens").is_none());
         assert_eq!(
             body.get("max_completion_tokens").and_then(|v| v.as_u64()),
-            Some(500)
+            Some(u64::from(DEFAULT_TEXT_MAX_TOKENS))
         );
     }
 
@@ -1923,6 +2026,20 @@ mod tests {
         assert_eq!(calls[0].id, "toolu_1");
         assert_eq!(calls[0].function.name, "task__list");
         assert_eq!(calls[0].function.arguments, r#"{"limit":3}"#);
+    }
+
+    #[tokio::test]
+    async fn test_parse_anthropic_output_text_response() {
+        let response = json!({
+            "content": [
+                { "type": "output_text", "text": "Final user answer." }
+            ]
+        })
+        .to_string();
+
+        let parsed = parse_anthropic_response_with_tools(response).await.unwrap();
+        assert_eq!(parsed.content.as_deref(), Some("Final user answer."));
+        assert!(parsed.tool_calls.is_none());
     }
 
     #[test]
@@ -2063,6 +2180,44 @@ mod tests {
         assert_eq!(calls[0].id, "toolu_1");
         assert_eq!(calls[0].function.name, "task__list");
         assert_eq!(calls[0].function.arguments, r#"{"limit":3}"#);
+    }
+
+    #[test]
+    fn test_anthropic_stream_event_accepts_output_text_delta() {
+        let mut state = AnthropicStreamState::default();
+        let mut events = Vec::new();
+
+        apply_anthropic_stream_event(
+            &mut state,
+            SseEvent {
+                event: Some("content_block_start".to_string()),
+                data: json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": { "type": "output_text" }
+                })
+                .to_string(),
+            },
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+        apply_anthropic_stream_event(
+            &mut state,
+            SseEvent {
+                event: Some("content_block_delta".to_string()),
+                data: json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": { "type": "output_text_delta", "text": "done" }
+                })
+                .to_string(),
+            },
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(state.content, "done");
+        assert_eq!(events, vec![LlmStreamEvent::Text("done".to_string())]);
     }
 
     #[test]

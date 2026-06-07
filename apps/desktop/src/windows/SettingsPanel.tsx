@@ -1,8 +1,9 @@
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { useEffect, useRef, useState } from 'react';
-import { api, AppSettings, type AvatarId, type ConnectorSpec, type ForegroundApp, type SettingsTab, type SkillPackage, type SkillSpec } from '../ipc/invoke';
+import { api, AppSettings, type AvatarId, type ConnectorSpec, type ForegroundApp, type LlmProfile, type CreateLlmProfileInput, type SettingsTab, type SkillPackage, type SkillSpec, listLlmProfiles, createLlmProfile, deleteLlmProfile } from '../ipc/invoke';
 import { ConnectorCard } from '../components/ConnectorCard';
 import { SkillCard } from '../components/SkillCard';
+import { ThemeSettings } from './ThemeSettings';
 
 const qingheSystemPrompt = `你是清和，一个新中式旗袍桌面助手。你的视觉设定是藏青色改良旗袍、5 颗红色圆珠盘扣、半扎棕色中长发与珍珠发夹，左腕黑色方形智能手表，右腕双层串珠手链。你的气质清冷沉静、温和专注、知性优雅。
 
@@ -146,6 +147,19 @@ export function SettingsPanel({ standalone = false }: SettingsPanelProps) {
   const [skillImportError, setSkillImportError] = useState('');
   const mdFileInputRef = useRef<HTMLInputElement>(null);
 
+  // Models tab state
+  const [llmProfiles, setLlmProfiles] = useState<LlmProfile[]>([]);
+  const [newProfile, setNewProfile] = useState<CreateLlmProfileInput>({
+    name: '',
+    provider: 'openai',
+    model_id: '',
+    api_base_url: '',
+    api_key: '',
+    max_tokens: 4096,
+    temperature: 0.7,
+  });
+  const [profileError, setProfileError] = useState('');
+
   useEffect(() => {
     api.getSettings().then((loaded) => {
       setSettings({
@@ -180,6 +194,7 @@ export function SettingsPanel({ standalone = false }: SettingsPanelProps) {
     api.listSkills().then(setSkillsList).catch(() => {});
     api.listSkillPackages().then(setSkillPackages).catch(() => {});
     api.listConnectors().then(setConnectors).catch(() => {});
+    listLlmProfiles().then(setLlmProfiles).catch(() => {});
   }, []);
 
   async function save() {
@@ -310,11 +325,13 @@ export function SettingsPanel({ standalone = false }: SettingsPanelProps) {
 
   const tabs: Array<{ id: SettingsTab; label: string }> = [
     { id: 'pet', label: '外观' },
+    { id: 'theme', label: '配色' },
     { id: 'persona', label: '表达' },
     { id: 'capabilities', label: 'Skills / MCP' },
     { id: 'proactive', label: '主动聊聊' },
     { id: 'llm', label: '语言模型' },
     { id: 'reminders', label: '提醒' },
+    { id: 'models', label: 'Models' },
   ];
 
   async function testConnection() {
@@ -376,6 +393,8 @@ export function SettingsPanel({ standalone = false }: SettingsPanelProps) {
       </div>
 
       <div className="settings-content">
+        {activeTab === 'theme' && <ThemeSettings />}
+
         {activeTab === 'llm' && <section className="settings-section">
           <h3>语言模型</h3>
           <label className="settings-label">
@@ -1330,6 +1349,158 @@ export function SettingsPanel({ standalone = false }: SettingsPanelProps) {
               </div>
             ))}
           </div>
+        </section>}
+
+        {activeTab === 'models' && <section className="settings-section">
+          <h3>Models</h3>
+          <p className="settings-section-desc">
+            管理 LLM Profile：每个 Profile 对应一个模型端点，可在路由策略里引用。
+          </p>
+
+          {llmProfiles.length > 0 ? (
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13, marginBottom: 16 }}>
+              <thead>
+                <tr style={{ opacity: 0.6, textAlign: 'left' }}>
+                  <th style={{ padding: '4px 8px' }}>名称</th>
+                  <th style={{ padding: '4px 8px' }}>Provider</th>
+                  <th style={{ padding: '4px 8px' }}>Model</th>
+                  <th style={{ padding: '4px 8px' }}>Transport</th>
+                  <th style={{ padding: '4px 8px' }}>状态</th>
+                  <th style={{ padding: '4px 8px' }}></th>
+                </tr>
+              </thead>
+              <tbody>
+                {llmProfiles.map((p) => (
+                  <tr key={p.id} style={{ borderTop: '1px solid rgba(255,255,255,0.08)' }}>
+                    <td style={{ padding: '6px 8px' }}>{p.name}</td>
+                    <td style={{ padding: '6px 8px', opacity: 0.7 }}>{p.provider}</td>
+                    <td style={{ padding: '6px 8px', opacity: 0.7 }}>{p.model_id}</td>
+                    <td style={{ padding: '6px 8px', opacity: 0.7 }}>{p.transport}</td>
+                    <td style={{ padding: '6px 8px' }}>
+                      <span className={`capability-badge ${p.enabled ? 'tone-green' : ''}`}>
+                        {p.enabled ? '启用' : '关闭'}
+                      </span>
+                    </td>
+                    <td style={{ padding: '6px 8px' }}>
+                      <button
+                        className="settings-test-btn"
+                        type="button"
+                        style={{ fontSize: 12, padding: '2px 8px' }}
+                        onClick={() => {
+                          deleteLlmProfile(p.id)
+                            .then(() => setLlmProfiles((prev) => prev.filter((x) => x.id !== p.id)))
+                            .catch((err: unknown) => setProfileError(err instanceof Error ? err.message : '删除失败'));
+                        }}
+                      >
+                        删除
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <div className="settings-empty" style={{ marginBottom: 16 }}>还没有添加 Profile</div>
+          )}
+
+          <details className="cap-section">
+            <summary className="cap-section-title">
+              <span>添加 Profile</span>
+            </summary>
+            <div className="cap-section-body">
+              {profileError && <div className="settings-error" style={{ marginBottom: 8 }}>{profileError}</div>}
+              <label className="settings-label">
+                名称
+                <input
+                  className="settings-input"
+                  value={newProfile.name}
+                  onChange={(e) => setNewProfile({ ...newProfile, name: e.target.value })}
+                  placeholder="My GPT-4o"
+                />
+              </label>
+              <label className="settings-label">
+                Provider
+                <select
+                  className="settings-select"
+                  value={newProfile.provider}
+                  onChange={(e) => setNewProfile({ ...newProfile, provider: e.target.value })}
+                >
+                  <option value="openai">openai</option>
+                  <option value="anthropic">anthropic</option>
+                  <option value="local">local</option>
+                  <option value="claude_cli">claude_cli</option>
+                  <option value="codex_cli">codex_cli</option>
+                  <option value="mcp_router">mcp_router</option>
+                </select>
+              </label>
+              <label className="settings-label">
+                Model ID
+                <input
+                  className="settings-input"
+                  value={newProfile.model_id}
+                  onChange={(e) => setNewProfile({ ...newProfile, model_id: e.target.value })}
+                  placeholder="gpt-4o"
+                />
+              </label>
+              <label className="settings-label">
+                API Base URL
+                <input
+                  className="settings-input"
+                  value={newProfile.api_base_url}
+                  onChange={(e) => setNewProfile({ ...newProfile, api_base_url: e.target.value })}
+                  placeholder="https://api.openai.com/v1"
+                />
+              </label>
+              <label className="settings-label">
+                API Key
+                <input
+                  type="password"
+                  className="settings-input"
+                  value={newProfile.api_key ?? ''}
+                  onChange={(e) => setNewProfile({ ...newProfile, api_key: e.target.value })}
+                  placeholder="sk-..."
+                />
+              </label>
+              <label className="settings-label">
+                Max Tokens
+                <input
+                  type="number"
+                  className="settings-input"
+                  value={newProfile.max_tokens ?? 4096}
+                  onChange={(e) => setNewProfile({ ...newProfile, max_tokens: Number(e.target.value) })}
+                />
+              </label>
+              <label className="settings-label">
+                Temperature: {(newProfile.temperature ?? 0.7).toFixed(1)}
+                <input
+                  type="range"
+                  className="settings-range"
+                  min="0"
+                  max="2"
+                  step="0.1"
+                  value={newProfile.temperature ?? 0.7}
+                  onChange={(e) => setNewProfile({ ...newProfile, temperature: Number(e.target.value) })}
+                />
+              </label>
+              <button
+                className="settings-save-btn"
+                type="button"
+                onClick={() => {
+                  setProfileError('');
+                  createLlmProfile(newProfile)
+                    .then((created) => {
+                      setLlmProfiles((prev) => [created, ...prev]);
+                      setNewProfile({ name: '', provider: 'openai', model_id: '', api_base_url: '', api_key: '', max_tokens: 4096, temperature: 0.7 });
+                      setStatus('Profile 已添加');
+                      setTimeout(() => setStatus(''), 3000);
+                    })
+                    .catch((err: unknown) => setProfileError(err instanceof Error ? err.message : '添加失败'));
+                }}
+              >
+                添加
+              </button>
+            </div>
+          </details>
         </section>}
       </div>
 

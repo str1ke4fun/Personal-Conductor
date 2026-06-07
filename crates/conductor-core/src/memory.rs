@@ -105,6 +105,7 @@ pub struct MemoryEntry {
     pub category: String,
     pub scope: MemoryScope,
     pub workspace_id: Option<String>,
+    pub path_prefix: Option<String>,
     pub source: MemorySource,
     pub confidence: f64,
     pub sensitivity: MemorySensitivity,
@@ -213,6 +214,21 @@ pub struct RecallResult {
     pub total_chunks_searched: usize,
 }
 
+/// Explicit recall context for prompt construction and future scoped retrieval.
+///
+/// All fields are enforced where the underlying memory rows carry the relevant
+/// scope metadata. Global/workspace memories without an explicit session or goal
+/// remain eligible so stable project facts still recall across turns.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RecallContext {
+    pub query: String,
+    pub workspace_id: Option<String>,
+    pub path_prefix: Option<String>,
+    pub session_id: Option<String>,
+    pub goal_id: Option<String>,
+    pub limit: usize,
+}
+
 /// Filter criteria for `search_memory_filtered`.
 ///
 /// Default (via `Default::default()`) excludes quarantined, forgotten, and archived
@@ -230,6 +246,15 @@ pub struct SearchFilter {
     pub max_sensitivity: Option<MemorySensitivity>,
     /// Filter by exact category match. `None` means all categories.
     pub category: Option<String>,
+    /// Limit workspace-scoped recall to entries whose stored path prefix is an
+    /// ancestor of the current context path. `None` means no path filtering.
+    pub path_prefix: Option<String>,
+    /// Exclude memories explicitly sourced from a different chat session.
+    /// Memories without source session metadata remain eligible.
+    pub session_id: Option<String>,
+    /// Exclude memories explicitly sourced from a different goal.
+    /// Memories without goal metadata remain eligible.
+    pub goal_id: Option<String>,
 }
 
 impl Default for SearchFilter {
@@ -240,8 +265,25 @@ impl Default for SearchFilter {
             exclude_archived: true,
             max_sensitivity: None,
             category: None,
+            path_prefix: None,
+            session_id: None,
+            goal_id: None,
         }
     }
+}
+
+fn normalize_path_prefix(path_prefix: &str) -> Option<String> {
+    let trimmed = path_prefix.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut normalized = trimmed.replace('\\', "/");
+    while normalized.len() > 1 && normalized.ends_with('/') && !normalized.ends_with(":/") {
+        normalized.pop();
+    }
+
+    Some(normalized)
 }
 
 impl MemorySensitivity {
@@ -311,7 +353,7 @@ impl EmbeddingModel for HashEmbeddingModel {
     }
 }
 
-/// FastEmbed-backed embedding model using BGE-small-en-v1.5.
+/// FastEmbed-backed embedding model using BGE-small-zh-v1.5 (Chinese-optimised).
 /// Falls back to `HashEmbeddingModel` if the model fails to load or embed.
 pub struct FastEmbedModel {
     inner: Option<fastembed::TextEmbedding>,
@@ -321,21 +363,21 @@ pub struct FastEmbedModel {
 impl FastEmbedModel {
     pub fn new() -> Self {
         let mut opts = fastembed::InitOptions::default();
-        opts.model_name = fastembed::EmbeddingModel::BGESmallENV15;
+        opts.model_name = fastembed::EmbeddingModel::BGESmallZHV15;
         opts.show_download_progress = true;
         match fastembed::TextEmbedding::try_new(opts) {
             Ok(model) => Self {
                 inner: Some(model),
-                dim: 384,
+                dim: 512,
             },
             Err(e) => {
                 tracing::warn!(
-                    "fastembed init failed, falling back to hash embedding: {}",
+                    "fastembed BGESmallZHV15 init failed, falling back to hash embedding: {}",
                     e
                 );
                 Self {
                     inner: None,
-                    dim: 384,
+                    dim: 512,
                 }
             }
         }
@@ -364,42 +406,42 @@ impl EmbeddingModel for FastEmbedModel {
     }
 
     fn model_name(&self) -> &str {
-        "bge-small-en-v1.5"
+        "bge-small-zh-v1.5"
     }
 }
 
-/// Placeholder for a future Chinese-optimized embedding model.
-/// Currently delegates to `HashEmbeddingModel`; replace the `embed` body
-/// with a real Chinese model (e.g. text2vec-base-chinese) when available.
+/// Chinese-optimized embedding model backed by BGE-small-zh-v1.5 via FastEmbed.
+/// Delegates to `FastEmbedModel` which already uses the Chinese model.
 pub struct ChineseEmbeddingModel {
-    dim: usize,
+    inner: FastEmbedModel,
 }
 
 impl ChineseEmbeddingModel {
     pub fn new(dim: usize) -> Self {
-        tracing::info!("ChineseEmbeddingModel created (placeholder, using hash fallback)");
-        Self { dim }
+        let _ = dim; // dim is fixed by the underlying model
+        Self {
+            inner: FastEmbedModel::new(),
+        }
     }
 }
 
 impl Default for ChineseEmbeddingModel {
     fn default() -> Self {
-        Self::new(384)
+        Self::new(512)
     }
 }
 
 impl EmbeddingModel for ChineseEmbeddingModel {
     fn embed(&self, text: &str) -> Vec<f32> {
-        // TODO: Replace with real Chinese embedding model
-        HashEmbeddingModel::new(self.dim).embed(text)
+        self.inner.embed(text)
     }
 
     fn dimension(&self) -> usize {
-        self.dim
+        self.inner.dimension()
     }
 
     fn model_name(&self) -> &str {
-        "chinese-embedding-placeholder"
+        self.inner.model_name()
     }
 }
 
@@ -483,21 +525,57 @@ pub async fn set_with_source(
     category: &str,
     source: &str,
 ) -> anyhow::Result<MemoryEntry> {
+    set_with_scope(key, value, category, MemoryScope::Global, None, source).await
+}
+
+/// Store or update a memory entry in an explicit scope.
+///
+/// Scoped writes only deduplicate within the same
+/// `(key, scope, workspace_id, path_prefix)` tuple, so the same logical key can
+/// safely exist in multiple workspaces and subtrees.
+pub async fn set_with_scope(
+    key: &str,
+    value: &str,
+    category: &str,
+    scope: MemoryScope,
+    workspace_id: Option<&str>,
+    source: &str,
+) -> anyhow::Result<MemoryEntry> {
+    set_with_scope_and_path(key, value, category, scope, workspace_id, None, source).await
+}
+
+/// Store or update a memory entry in an explicit scope and optional path subtree.
+pub async fn set_with_scope_and_path(
+    key: &str,
+    value: &str,
+    category: &str,
+    scope: MemoryScope,
+    workspace_id: Option<&str>,
+    path_prefix: Option<&str>,
+    source: &str,
+) -> anyhow::Result<MemoryEntry> {
     let pool = db::pool().await?;
     let now = Utc::now();
     let (mem_source, default_status, default_confidence) = write_gate(source)?;
+    let normalized_path_prefix = path_prefix.and_then(normalize_path_prefix);
 
     let existing = sqlx::query(
         r#"
-        SELECT id, key, value, category, scope, workspace_id, source, confidence,
+        SELECT id, key, value, category, scope, workspace_id, path_prefix, source, confidence,
                sensitivity, status, expires_at, last_used_at, created_at, updated_at
         FROM memory_entries
         WHERE key = ?1
+          AND scope = ?2
+          AND ((?3 IS NULL AND workspace_id IS NULL) OR workspace_id = ?3)
+          AND ((?4 IS NULL AND path_prefix IS NULL) OR path_prefix = ?4)
         ORDER BY updated_at DESC
         LIMIT 1
         "#,
     )
     .bind(key)
+    .bind(scope.as_str())
+    .bind(workspace_id)
+    .bind(normalized_path_prefix.as_deref())
     .fetch_optional(&pool)
     .await?;
 
@@ -508,14 +586,15 @@ pub async fn set_with_source(
         entry.source = mem_source.clone();
         entry.confidence = default_confidence;
         entry.status = default_status.to_string();
+        entry.path_prefix = normalized_path_prefix.clone();
         entry.updated_at = now;
 
         sqlx::query(
             r#"
             UPDATE memory_entries
             SET value = ?1, category = ?2, source = ?3, confidence = ?4,
-                status = ?5, updated_at = ?6
-            WHERE id = ?7
+                status = ?5, path_prefix = ?6, updated_at = ?7
+            WHERE id = ?8
             "#,
         )
         .bind(&entry.value)
@@ -523,16 +602,29 @@ pub async fn set_with_source(
         .bind(entry.source.as_str())
         .bind(entry.confidence)
         .bind(&entry.status)
+        .bind(&entry.path_prefix)
         .bind(entry.updated_at.to_rfc3339())
         .bind(&entry.id)
         .execute(&pool)
         .await?;
 
-        sqlx::query("DELETE FROM memory_entries WHERE key = ?1 AND id != ?2")
-            .bind(&entry.key)
-            .bind(&entry.id)
-            .execute(&pool)
-            .await?;
+        sqlx::query(
+            r#"
+            DELETE FROM memory_entries
+            WHERE key = ?1
+              AND scope = ?2
+              AND id != ?3
+              AND ((?4 IS NULL AND workspace_id IS NULL) OR workspace_id = ?4)
+              AND ((?5 IS NULL AND path_prefix IS NULL) OR path_prefix = ?5)
+            "#,
+        )
+        .bind(&entry.key)
+        .bind(entry.scope.as_str())
+        .bind(&entry.id)
+        .bind(entry.workspace_id.as_deref())
+        .bind(entry.path_prefix.as_deref())
+        .execute(&pool)
+        .await?;
 
         // Write-through: index into chunks/embeddings for search
         if let Err(e) = index_memory_entry(&entry).await {
@@ -547,8 +639,9 @@ pub async fn set_with_source(
         key: key.to_string(),
         value: value.to_string(),
         category: category.to_string(),
-        scope: MemoryScope::Global,
-        workspace_id: None,
+        scope,
+        workspace_id: workspace_id.map(str::to_string),
+        path_prefix: normalized_path_prefix.clone(),
         source: mem_source,
         confidence: default_confidence,
         sensitivity: MemorySensitivity::Normal,
@@ -564,10 +657,10 @@ pub async fn set_with_source(
 
     sqlx::query(
         r#"
-        INSERT INTO memory_entries (id, key, value, category, scope, workspace_id, source,
+        INSERT INTO memory_entries (id, key, value, category, scope, workspace_id, path_prefix, source,
                                    confidence, sensitivity, status, expires_at, last_used_at,
                                    created_at, updated_at, interaction_count, last_reinforced_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
         "#,
     )
     .bind(&entry.id)
@@ -576,6 +669,7 @@ pub async fn set_with_source(
     .bind(&entry.category)
     .bind(entry.scope.as_str())
     .bind(&entry.workspace_id)
+    .bind(&entry.path_prefix)
     .bind(entry.source.as_str())
     .bind(entry.confidence)
     .bind(entry.sensitivity.as_str())
@@ -595,6 +689,25 @@ pub async fn set_with_source(
     }
 
     Ok(entry)
+}
+
+/// Convenience wrapper for workspace-scoped writes.
+pub async fn set_for_workspace(
+    key: &str,
+    value: &str,
+    category: &str,
+    workspace_id: &str,
+    source: &str,
+) -> anyhow::Result<MemoryEntry> {
+    set_with_scope(
+        key,
+        value,
+        category,
+        MemoryScope::Workspace,
+        Some(workspace_id),
+        source,
+    )
+    .await
 }
 
 /// Promote or change the status of a memory entry by key.
@@ -652,7 +765,7 @@ pub async fn get_by_category(category: &str) -> anyhow::Result<Vec<MemoryEntry>>
     let pool = db::pool().await?;
     let rows = sqlx::query(
         r#"
-        SELECT id, key, value, category, scope, workspace_id, source, confidence,
+        SELECT id, key, value, category, scope, workspace_id, path_prefix, source, confidence,
                sensitivity, status, expires_at, last_used_at, created_at, updated_at
         FROM memory_entries
         WHERE category = ?1 AND status = 'active'
@@ -795,19 +908,19 @@ pub async fn list_all(
 
     let (query_str, binds): (&str, Vec<String>) = match (category, status) {
         (Some(cat), Some(st)) => (
-            "SELECT id, key, value, category, scope, workspace_id, source, confidence,              sensitivity, status, expires_at, last_used_at, created_at, updated_at              FROM memory_entries WHERE category = ?1 AND status = ?2 ORDER BY updated_at DESC",
+            "SELECT id, key, value, category, scope, workspace_id, path_prefix, source, confidence,              sensitivity, status, expires_at, last_used_at, created_at, updated_at              FROM memory_entries WHERE category = ?1 AND status = ?2 ORDER BY updated_at DESC",
             vec![cat.to_string(), st.to_string()],
         ),
         (Some(cat), None) => (
-            "SELECT id, key, value, category, scope, workspace_id, source, confidence,              sensitivity, status, expires_at, last_used_at, created_at, updated_at              FROM memory_entries WHERE category = ?1 AND status != 'forgotten' ORDER BY updated_at DESC",
+            "SELECT id, key, value, category, scope, workspace_id, path_prefix, source, confidence,              sensitivity, status, expires_at, last_used_at, created_at, updated_at              FROM memory_entries WHERE category = ?1 AND status != 'forgotten' ORDER BY updated_at DESC",
             vec![cat.to_string()],
         ),
         (None, Some(st)) => (
-            "SELECT id, key, value, category, scope, workspace_id, source, confidence,              sensitivity, status, expires_at, last_used_at, created_at, updated_at              FROM memory_entries WHERE status = ?1 ORDER BY updated_at DESC",
+            "SELECT id, key, value, category, scope, workspace_id, path_prefix, source, confidence,              sensitivity, status, expires_at, last_used_at, created_at, updated_at              FROM memory_entries WHERE status = ?1 ORDER BY updated_at DESC",
             vec![st.to_string()],
         ),
         (None, None) => (
-            "SELECT id, key, value, category, scope, workspace_id, source, confidence,              sensitivity, status, expires_at, last_used_at, created_at, updated_at              FROM memory_entries WHERE status != 'forgotten' ORDER BY updated_at DESC",
+            "SELECT id, key, value, category, scope, workspace_id, path_prefix, source, confidence,              sensitivity, status, expires_at, last_used_at, created_at, updated_at              FROM memory_entries WHERE status != 'forgotten' ORDER BY updated_at DESC",
             vec![],
         ),
     };
@@ -842,6 +955,39 @@ pub async fn update_status_by_id(id: &str, new_status: &str) -> anyhow::Result<b
 /// Forget a memory entry by its ID.
 pub async fn forget_by_id(id: &str) -> anyhow::Result<bool> {
     update_status_by_id(id, "forgotten").await
+}
+
+/// Update the `value` field of a memory entry by its ID.
+pub async fn update_value_by_id(id: &str, value: &str) -> anyhow::Result<bool> {
+    let pool = db::pool().await?;
+    let now = Utc::now();
+    let result = sqlx::query("UPDATE memory_entries SET value = ?1, updated_at = ?2 WHERE id = ?3")
+        .bind(value)
+        .bind(now.to_rfc3339())
+        .bind(id)
+        .execute(&pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Hard-delete a memory entry and its associated chunks and embeddings by ID.
+pub async fn delete_by_id(id: &str) -> anyhow::Result<bool> {
+    let pool = db::pool().await?;
+    sqlx::query(
+        "DELETE FROM memory_embeddings WHERE chunk_id IN (SELECT id FROM memory_chunks WHERE memory_id = ?1)",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await?;
+    sqlx::query("DELETE FROM memory_chunks WHERE memory_id = ?1")
+        .bind(id)
+        .execute(&pool)
+        .await?;
+    let result = sqlx::query("DELETE FROM memory_entries WHERE id = ?1")
+        .bind(id)
+        .execute(&pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// Rebuild all memory chunks and embeddings from active memory entries.
@@ -1192,6 +1338,7 @@ pub async fn reinforce_pattern(
             category: pattern_kind.to_string(),
             scope: MemoryScope::Workspace,
             workspace_id: Some(workspace_id.to_string()),
+            path_prefix: None,
             source: MemorySource::PatternAggregation,
             confidence: INITIAL_CONFIDENCE,
             sensitivity: MemorySensitivity::Normal,
@@ -1207,10 +1354,10 @@ pub async fn reinforce_pattern(
 
         sqlx::query(
             r#"
-            INSERT INTO memory_entries (id, key, value, category, scope, workspace_id, source,
+            INSERT INTO memory_entries (id, key, value, category, scope, workspace_id, path_prefix, source,
                                        confidence, sensitivity, status, expires_at, last_used_at,
                                        created_at, updated_at, interaction_count, last_reinforced_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
             "#,
         )
         .bind(&entry.id)
@@ -1219,6 +1366,7 @@ pub async fn reinforce_pattern(
         .bind(&entry.category)
         .bind(entry.scope.as_str())
         .bind(&entry.workspace_id)
+        .bind(&entry.path_prefix)
         .bind(entry.source.as_str())
         .bind(entry.confidence)
         .bind(entry.sensitivity.as_str())
@@ -1400,11 +1548,51 @@ pub async fn recall_for_prompt(
     workspace_id: Option<&str>,
     limit: usize,
 ) -> anyhow::Result<RecallResult> {
+    let recall_context = RecallContext {
+        query: context.to_string(),
+        workspace_id: workspace_id.map(str::to_string),
+        path_prefix: None,
+        session_id: None,
+        goal_id: None,
+        limit,
+    };
+
+    recall_for_prompt_with_context(&recall_context).await
+}
+
+/// Multi-path recall for prompt injection using an explicit retrieval context.
+pub async fn recall_for_prompt_with_context(
+    context: &RecallContext,
+) -> anyhow::Result<RecallResult> {
     let pool = db::pool().await?;
+    let limit = if context.limit == 0 { 5 } else { context.limit };
 
     // Path 1: Semantic search over all indexed chunks (entries + summaries)
-    let search_results =
-        search_memory_filtered(context, workspace_id, limit, SearchFilter::default()).await?;
+    let search_results = search_memory_filtered(
+        &context.query,
+        context.workspace_id.as_deref(),
+        limit,
+        SearchFilter {
+            path_prefix: context
+                .path_prefix
+                .as_deref()
+                .and_then(normalize_path_prefix),
+            session_id: context
+                .session_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            goal_id: context
+                .goal_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            ..SearchFilter::default()
+        },
+    )
+    .await?;
 
     let mut seen_entry_ids = std::collections::HashSet::new();
     let mut seen_summary_ids = std::collections::HashSet::new();
@@ -1430,7 +1618,7 @@ pub async fn recall_for_prompt(
     }
 
     // Path 2: Keyword search over conversation_summaries
-    let keyword_summaries = search_conversations(context).await?;
+    let keyword_summaries = search_conversations(&context.query).await?;
     for cs in keyword_summaries {
         if seen_summary_ids.insert(cs.id.clone()) {
             summaries.push(cs);
@@ -1455,7 +1643,7 @@ async fn fetch_entry_by_id(
 ) -> anyhow::Result<Option<MemoryEntry>> {
     let row = sqlx::query(
         r#"
-        SELECT id, key, value, category, scope, workspace_id, source, confidence,
+        SELECT id, key, value, category, scope, workspace_id, path_prefix, source, confidence,
                sensitivity, status, expires_at, last_used_at, created_at, updated_at
         FROM memory_entries
         WHERE id = ?1
@@ -1518,6 +1706,7 @@ fn memory_from_row(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<MemoryEntry> 
         category: row.try_get("category")?,
         scope: MemoryScope::from_str(row.try_get::<String, _>("scope")?.as_str())?,
         workspace_id: row.try_get("workspace_id")?,
+        path_prefix: row.try_get("path_prefix").ok().flatten(),
         source: MemorySource::from_str(row.try_get::<String, _>("source")?.as_str())?,
         confidence: row.try_get("confidence")?,
         sensitivity: MemorySensitivity::from_str(
@@ -1756,6 +1945,40 @@ pub async fn index_conversation_summary(summary: &ConversationSummary) -> anyhow
     Ok(())
 }
 
+/// Re-index an existing memory_chunks row by regenerating its embedding.
+/// Useful after provider changes or embedding dimension updates. (文档 B §十 阶段 1)
+pub async fn reindex_memory_chunk(chunk_id: &str) -> anyhow::Result<()> {
+    let pool = db::pool().await?;
+    let row = sqlx::query("SELECT content FROM memory_chunks WHERE id = ?1")
+        .bind(chunk_id)
+        .fetch_optional(&pool)
+        .await?;
+    let Some(row) = row else {
+        anyhow::bail!("memory_chunk not found: {chunk_id}");
+    };
+    let content: String = sqlx::Row::try_get(&row, "content")?;
+
+    // Delete existing embedding for this chunk
+    sqlx::query("DELETE FROM memory_embeddings WHERE chunk_id = ?1")
+        .bind(chunk_id)
+        .execute(&pool)
+        .await?;
+
+    // Regenerate and store new embedding
+    let model_name = current_model_name();
+    let vector = generate_embedding(&content).await?;
+    let embedding = MemoryEmbedding {
+        chunk_id: chunk_id.to_string(),
+        model: model_name,
+        dims: vector.len(),
+        vector,
+        created_at: Utc::now(),
+    };
+    create_memory_embedding(embedding).await?;
+
+    Ok(())
+}
+
 /// Remove all chunks (and their embeddings) that originated from a given memory_entries row.
 /// Called by archive/forget/quarantine so the entry disappears from search results.
 async fn cleanup_entry_chunks(entry_id: &str) -> anyhow::Result<()> {
@@ -1824,6 +2047,20 @@ pub async fn search_memory_filtered(
         .unwrap_or(MemorySensitivity::Secret.level());
 
     let now = Utc::now().to_rfc3339();
+    let normalized_path_prefix = filter
+        .path_prefix
+        .as_deref()
+        .and_then(normalize_path_prefix);
+    let normalized_session_id = filter
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let normalized_goal_id = filter
+        .goal_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
 
     // Build query dynamically since sqlx compile-time macros can't handle
     // a variable number of IN(...) placeholders.
@@ -1846,6 +2083,31 @@ pub async fn search_memory_filtered(
         bind_idx += 1;
     } else {
         sql.push_str(" AND mc.scope = 'global'");
+    }
+
+    if normalized_path_prefix.is_some() {
+        sql.push_str(&format!(
+            " AND (ment.id IS NULL OR ment.path_prefix IS NULL OR ${0} = REPLACE(ment.path_prefix, '\\', '/') OR ${1} LIKE REPLACE(ment.path_prefix, '\\', '/') || '/%')",
+            bind_idx,
+            bind_idx + 1
+        ));
+        bind_idx += 2;
+    }
+
+    if normalized_session_id.is_some() {
+        sql.push_str(&format!(
+            " AND (ment.id IS NULL OR ment.source_session_id IS NULL OR ment.source_session_id = ${})",
+            bind_idx
+        ));
+        bind_idx += 1;
+    }
+
+    if normalized_goal_id.is_some() {
+        sql.push_str(&format!(
+            " AND (ment.id IS NULL OR ment.goal_id IS NULL OR ment.goal_id = ${})",
+            bind_idx
+        ));
+        bind_idx += 1;
     }
 
     // Status exclusion filter
@@ -1901,6 +2163,19 @@ pub async fn search_memory_filtered(
 
     if let Some(wid) = workspace_id {
         q = q.bind(wid);
+    }
+
+    if let Some(path_prefix) = normalized_path_prefix.as_deref() {
+        q = q.bind(path_prefix);
+        q = q.bind(path_prefix);
+    }
+
+    if let Some(session_id) = normalized_session_id {
+        q = q.bind(session_id);
+    }
+
+    if let Some(goal_id) = normalized_goal_id {
+        q = q.bind(goal_id);
     }
 
     for status in &excluded_statuses {
@@ -2095,6 +2370,13 @@ pub async fn init_db() -> anyhow::Result<()> {
             category TEXT NOT NULL,
             scope TEXT NOT NULL DEFAULT 'global',
             workspace_id TEXT,
+            path_prefix TEXT,
+            source_session_id TEXT,
+            source_turn_id TEXT,
+            source_message_id TEXT,
+            source_projection_id TEXT,
+            source_tool_call_id TEXT,
+            goal_id TEXT,
             source TEXT NOT NULL DEFAULT 'user_confirmed',
             confidence REAL NOT NULL DEFAULT 1.0,
             sensitivity TEXT NOT NULL DEFAULT 'normal',
@@ -2107,6 +2389,16 @@ pub async fn init_db() -> anyhow::Result<()> {
     )
     .execute(&pool)
     .await?;
+    for ddl in [
+        "ALTER TABLE memory_entries ADD COLUMN source_session_id TEXT",
+        "ALTER TABLE memory_entries ADD COLUMN source_turn_id TEXT",
+        "ALTER TABLE memory_entries ADD COLUMN source_message_id TEXT",
+        "ALTER TABLE memory_entries ADD COLUMN source_projection_id TEXT",
+        "ALTER TABLE memory_entries ADD COLUMN source_tool_call_id TEXT",
+        "ALTER TABLE memory_entries ADD COLUMN goal_id TEXT",
+    ] {
+        let _ = sqlx::query(ddl).execute(&pool).await;
+    }
 
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_memory_key ON memory_entries(key);")
         .execute(&pool)
@@ -2122,6 +2414,19 @@ pub async fn init_db() -> anyhow::Result<()> {
     )
     .execute(&pool)
     .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_memory_path_prefix ON memory_entries(path_prefix);",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_memory_source_session ON memory_entries(source_session_id);",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_memory_goal ON memory_entries(goal_id);")
+        .execute(&pool)
+        .await?;
 
     sqlx::query(
         r#"
@@ -2216,6 +2521,9 @@ pub async fn init_db() -> anyhow::Result<()> {
     .execute(&pool)
     .await;
     let _ = sqlx::query("ALTER TABLE memory_entries ADD COLUMN last_reinforced_at TEXT")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE memory_entries ADD COLUMN path_prefix TEXT")
         .execute(&pool)
         .await;
 
@@ -3579,6 +3887,9 @@ mod tests {
             exclude_archived: true,
             max_sensitivity: None,
             category: None,
+            path_prefix: None,
+            session_id: None,
+            goal_id: None,
         };
         let results_inclusive = search_memory_filtered("secret algorithm", None, 5, filter)
             .await
@@ -3959,6 +4270,213 @@ mod tests {
         assert!(
             result.total_chunks_searched > 0,
             "total_chunks_searched should be > 0 when results exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recall_for_prompt_with_context_honors_workspace_scope() {
+        let _root = TestRoot::new();
+        init_db().await.expect("init db");
+        set_embedding_model(Box::new(HashEmbeddingModel::default()));
+
+        set_for_workspace(
+            "auth_module",
+            "workspace alpha auth guidance",
+            "project",
+            "ws-alpha",
+            "user",
+        )
+        .await
+        .expect("set alpha workspace memory");
+        set_for_workspace(
+            "auth_module",
+            "workspace beta auth guidance",
+            "project",
+            "ws-beta",
+            "user",
+        )
+        .await
+        .expect("set beta workspace memory");
+
+        let alpha_context = RecallContext {
+            query: "auth guidance".to_string(),
+            workspace_id: Some("ws-alpha".to_string()),
+            path_prefix: Some("crates/conductor-core/src/chat".to_string()),
+            session_id: None,
+            goal_id: None,
+            limit: 10,
+        };
+        let alpha_result = recall_for_prompt_with_context(&alpha_context)
+            .await
+            .expect("alpha recall");
+
+        assert!(
+            alpha_result.entries.iter().any(|entry| {
+                entry.workspace_id.as_deref() == Some("ws-alpha")
+                    && entry.value.contains("workspace alpha")
+            }),
+            "alpha recall should include alpha-scoped memory"
+        );
+        assert!(
+            !alpha_result.entries.iter().any(|entry| {
+                entry.workspace_id.as_deref() == Some("ws-beta")
+                    && entry.value.contains("workspace beta")
+            }),
+            "alpha recall should exclude beta-scoped memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recall_for_prompt_with_context_honors_session_and_goal_scope() {
+        let _root = TestRoot::new();
+        init_db().await.expect("init db");
+        set_embedding_model(Box::new(HashEmbeddingModel::default()));
+
+        let matching = set(
+            "routing_scope_matching",
+            "perimeter orchid guidance from matching session",
+            "project",
+        )
+        .await
+        .expect("set matching memory");
+        let other = set(
+            "routing_scope_other",
+            "perimeter orchid guidance from other session",
+            "project",
+        )
+        .await
+        .expect("set other memory");
+        let global = set(
+            "routing_scope_global",
+            "perimeter orchid guidance without session metadata",
+            "project",
+        )
+        .await
+        .expect("set global memory");
+
+        let pool = db::pool().await.expect("pool");
+        sqlx::query(
+            r#"
+            UPDATE memory_entries
+            SET source_session_id = ?1, goal_id = ?2
+            WHERE id = ?3
+            "#,
+        )
+        .bind("session-a")
+        .bind("goal-a")
+        .bind(&matching.id)
+        .execute(&pool)
+        .await
+        .expect("tag matching memory");
+        sqlx::query(
+            r#"
+            UPDATE memory_entries
+            SET source_session_id = ?1, goal_id = ?2
+            WHERE id = ?3
+            "#,
+        )
+        .bind("session-b")
+        .bind("goal-b")
+        .bind(&other.id)
+        .execute(&pool)
+        .await
+        .expect("tag other memory");
+
+        let result = recall_for_prompt_with_context(&RecallContext {
+            query: "perimeter orchid guidance".to_string(),
+            workspace_id: None,
+            path_prefix: None,
+            session_id: Some("session-a".to_string()),
+            goal_id: Some("goal-a".to_string()),
+            limit: 10,
+        })
+        .await
+        .expect("recall with session and goal");
+
+        assert!(
+            result.entries.iter().any(|entry| entry.id == matching.id),
+            "recall should include memory explicitly tagged to the active session and goal"
+        );
+        assert!(
+            result.entries.iter().any(|entry| entry.id == global.id),
+            "recall should keep untagged global memory eligible"
+        );
+        assert!(
+            !result.entries.iter().any(|entry| entry.id == other.id),
+            "recall should exclude memory explicitly tagged to another session and goal"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recall_for_prompt_with_context_honors_path_prefix_scope() {
+        let _root = TestRoot::new();
+        init_db().await.expect("init db");
+        set_embedding_model(Box::new(HashEmbeddingModel::default()));
+
+        set_for_workspace(
+            "repo_auth",
+            "workspace auth guidance",
+            "project",
+            "ws-alpha",
+            "user",
+        )
+        .await
+        .expect("set workspace memory");
+        set_with_scope_and_path(
+            "chat_auth",
+            "chat subtree auth guidance",
+            "project",
+            MemoryScope::Workspace,
+            Some("ws-alpha"),
+            Some("crates/conductor-core/src/chat"),
+            "user",
+        )
+        .await
+        .expect("set chat path memory");
+        set_with_scope_and_path(
+            "memory_auth",
+            "memory subtree auth guidance",
+            "project",
+            MemoryScope::Workspace,
+            Some("ws-alpha"),
+            Some("crates/conductor-core/src/memory"),
+            "user",
+        )
+        .await
+        .expect("set memory path memory");
+
+        let chat_context = RecallContext {
+            query: "auth guidance".to_string(),
+            workspace_id: Some("ws-alpha".to_string()),
+            path_prefix: Some("crates/conductor-core/src/chat/tools".to_string()),
+            session_id: None,
+            goal_id: None,
+            limit: 10,
+        };
+        let chat_result = recall_for_prompt_with_context(&chat_context)
+            .await
+            .expect("chat recall");
+
+        assert!(
+            chat_result
+                .entries
+                .iter()
+                .any(|entry| entry.key == "repo_auth" && entry.path_prefix.is_none()),
+            "chat recall should include workspace-wide memory"
+        );
+        assert!(
+            chat_result.entries.iter().any(|entry| {
+                entry.key == "chat_auth"
+                    && entry.path_prefix.as_deref() == Some("crates/conductor-core/src/chat")
+            }),
+            "chat recall should include ancestor path memory"
+        );
+        assert!(
+            !chat_result
+                .entries
+                .iter()
+                .any(|entry| entry.key == "memory_auth"),
+            "chat recall should exclude sibling path memory"
         );
     }
 

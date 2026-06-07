@@ -9,6 +9,7 @@ pub struct ToolCall {
     pub id: String,
     pub session_id: Option<String>,
     pub workspace_id: Option<String>,
+    pub turn_id: Option<String>,
     pub llm_tool_call_id: Option<String>,
     pub tool_id: String,
     pub input_json: String,
@@ -30,6 +31,7 @@ pub struct ToolCallCreate {
     pub id: String,
     pub session_id: Option<String>,
     pub workspace_id: Option<String>,
+    pub turn_id: Option<String>,
     pub llm_tool_call_id: Option<String>,
     pub tool_id: String,
     pub input_json: String,
@@ -41,6 +43,7 @@ pub struct ToolCallCreate {
 pub struct ToolCallFilter {
     pub session_id: Option<String>,
     pub workspace_id: Option<String>,
+    pub turn_id: Option<String>,
     pub llm_tool_call_id: Option<String>,
     pub tool_id: Option<String>,
     pub status: Option<String>,
@@ -55,15 +58,16 @@ pub async fn create(input: ToolCallCreate) -> Result<ToolCall> {
     sqlx::query(
         r#"
         INSERT INTO tool_calls (
-            id, session_id, workspace_id, llm_tool_call_id, tool_id, input_json,
+            id, session_id, workspace_id, turn_id, llm_tool_call_id, tool_id, input_json,
             status, started_at, agent_run_id, risk_level
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, ?9)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?10)
         "#,
     )
     .bind(&input.id)
     .bind(&input.session_id)
     .bind(&input.workspace_id)
+    .bind(&input.turn_id)
     .bind(&input.llm_tool_call_id)
     .bind(&input.tool_id)
     .bind(&input.input_json)
@@ -77,6 +81,7 @@ pub async fn create(input: ToolCallCreate) -> Result<ToolCall> {
         id: input.id,
         session_id: input.session_id,
         workspace_id: input.workspace_id,
+        turn_id: input.turn_id,
         llm_tool_call_id: input.llm_tool_call_id,
         tool_id: input.tool_id,
         input_json: input.input_json,
@@ -151,6 +156,22 @@ pub async fn attach_command_run(id: &str, command_run_id: &str) -> Result<()> {
     Ok(())
 }
 
+pub async fn attach_agent_run(id: &str, agent_run_id: &str) -> Result<()> {
+    let pool = db::pool().await?;
+    sqlx::query(
+        r#"
+        UPDATE tool_calls
+        SET agent_run_id = ?1
+        WHERE id = ?2
+        "#,
+    )
+    .bind(agent_run_id)
+    .bind(id)
+    .execute(&pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn mark_approval_required(
     id: &str,
     proposal_id: &str,
@@ -217,13 +238,32 @@ pub async fn fail(id: &str, error: &str) -> Result<()> {
     Ok(())
 }
 
+pub async fn fail_incomplete_for_turn(turn_id: &str, error: &str) -> Result<u64> {
+    let pool = db::pool().await?;
+    let now = Utc::now();
+    let result = sqlx::query(
+        r#"
+        UPDATE tool_calls
+        SET status = 'failed', error = ?1, completed_at = ?2,
+            duration_ms = CAST((julianday(?2) - julianday(started_at)) * 86400000 AS INTEGER)
+        WHERE turn_id = ?3 AND status IN ('pending', 'executing')
+        "#,
+    )
+    .bind(error)
+    .bind(now.to_rfc3339())
+    .bind(turn_id)
+    .execute(&pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 pub async fn get(id: &str) -> Result<ToolCall> {
     let pool = db::pool().await?;
     let row = sqlx::query(
         r#"
         SELECT id, session_id, tool_id, input_json, output_json, status, error,
                started_at, completed_at, duration_ms, agent_run_id,
-               workspace_id, llm_tool_call_id, risk_level, proposal_id,
+               workspace_id, turn_id, llm_tool_call_id, risk_level, proposal_id,
                permission_grant_id, command_run_id
         FROM tool_calls WHERE id = ?1
         "#,
@@ -240,7 +280,7 @@ pub async fn list(filter: ToolCallFilter) -> Result<Vec<ToolCall>> {
 
     let mut sql = String::from(
         "SELECT id, session_id, tool_id, input_json, output_json, status, error, \
-         started_at, completed_at, duration_ms, agent_run_id, workspace_id, \
+         started_at, completed_at, duration_ms, agent_run_id, workspace_id, turn_id, \
          llm_tool_call_id, risk_level, proposal_id, permission_grant_id, command_run_id \
          FROM tool_calls WHERE 1=1",
     );
@@ -253,6 +293,10 @@ pub async fn list(filter: ToolCallFilter) -> Result<Vec<ToolCall>> {
     if let Some(ref wid) = filter.workspace_id {
         binds.push(wid.clone());
         sql.push_str(&format!(" AND workspace_id = ?{}", binds.len()));
+    }
+    if let Some(ref turn_id) = filter.turn_id {
+        binds.push(turn_id.clone());
+        sql.push_str(&format!(" AND turn_id = ?{}", binds.len()));
     }
     if let Some(ref llm_id) = filter.llm_tool_call_id {
         binds.push(llm_id.clone());
@@ -297,6 +341,7 @@ fn row_to_tool_call(row: sqlx::sqlite::SqliteRow) -> Result<ToolCall> {
         id: row.try_get("id")?,
         session_id: row.try_get("session_id")?,
         workspace_id: row.try_get("workspace_id")?,
+        turn_id: row.try_get("turn_id")?,
         llm_tool_call_id: row.try_get("llm_tool_call_id")?,
         tool_id: row.try_get("tool_id")?,
         input_json: row.try_get("input_json")?,
@@ -326,6 +371,7 @@ mod tests {
             id: id.into(),
             session_id: session_id.map(str::to_string),
             workspace_id: Some("ws-1".into()),
+            turn_id: Some("turn-1".into()),
             llm_tool_call_id: Some(format!("llm-{id}")),
             tool_id: tool_id.into(),
             input_json: "{}".into(),
@@ -383,6 +429,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fail_incomplete_for_turn_marks_pending_and_executing() {
+        let _root = TestRoot::new();
+        create(make_tool_call("tc-incomplete-pending", None, "file.read"))
+            .await
+            .expect("create pending");
+        create(make_tool_call("tc-incomplete-executing", None, "file.grep"))
+            .await
+            .expect("create executing");
+        create(make_tool_call("tc-incomplete-done", None, "file.glob"))
+            .await
+            .expect("create done");
+
+        mark_executing("tc-incomplete-executing")
+            .await
+            .expect("mark executing");
+        complete("tc-incomplete-done", "{}")
+            .await
+            .expect("complete");
+
+        let updated = fail_incomplete_for_turn("turn-1", "turn timed out")
+            .await
+            .expect("fail incomplete");
+        assert_eq!(updated, 2);
+
+        let pending = get("tc-incomplete-pending").await.expect("get pending");
+        let executing = get("tc-incomplete-executing").await.expect("get executing");
+        let done = get("tc-incomplete-done").await.expect("get done");
+        assert_eq!(pending.status, "failed");
+        assert_eq!(executing.status, "failed");
+        assert_eq!(done.status, "succeeded");
+    }
+
+    #[tokio::test]
     async fn list_with_filter() {
         let _root = TestRoot::new();
         create(make_tool_call("tc-010", Some("s1"), "file.read"))
@@ -431,6 +510,9 @@ mod tests {
             .expect("create");
 
         mark_executing("tc-020").await.expect("mark executing");
+        attach_agent_run("tc-020", "ar-020")
+            .await
+            .expect("attach agent run");
         attach_command_run("tc-020", "cr-020")
             .await
             .expect("attach command run");
@@ -440,6 +522,7 @@ mod tests {
 
         let got = get("tc-020").await.expect("get");
         assert_eq!(got.status, "approval_required");
+        assert_eq!(got.agent_run_id, Some("ar-020".into()));
         assert_eq!(got.command_run_id, Some("cr-020".into()));
         assert_eq!(got.proposal_id, Some("p-020".into()));
         assert_eq!(got.permission_grant_id, Some("pg-020".into()));

@@ -7,17 +7,16 @@ interface CompletionSummaryCardProps {
   durationMs?: number;
 }
 
-const STEP_ICONS: Record<'done' | 'skipped' | 'failed', string> = {
-  done: '完成',
-  skipped: '跳过',
-  failed: '异常',
+type StepStatus = 'done' | 'skipped' | 'failed';
+
+const STEP_GLYPH: Record<StepStatus, string> = {
+  done: '✓',
+  skipped: '–',
+  failed: '✕',
 };
 
-function stepIconForStatus(status: CompletionStep['status']): string {
-  if (status === 'done' || status === 'skipped' || status === 'failed') {
-    return STEP_ICONS[status];
-  }
-  return '完成';
+function normalizeStatus(status: CompletionStep['status']): StepStatus {
+  return status === 'skipped' || status === 'failed' ? status : 'done';
 }
 
 export function CompletionSummaryCard({
@@ -29,10 +28,15 @@ export function CompletionSummaryCard({
   const formatDuration = (ms: number) =>
     ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
 
+  const hasFailure = steps?.some((s) => s.status === 'failed') ?? false;
+  const cardTone = hasFailure ? 'has-failure' : 'all-clear';
+
   return (
-    <div className="completion-card">
+    <div className={`completion-card completion-card--${cardTone}`}>
       <div className="completion-header">
-        <span className="completion-icon">完成</span>
+        <span className="completion-badge" aria-hidden>
+          {hasFailure ? '!' : '✓'}
+        </span>
         <span className="completion-title">{title}</span>
         {durationMs !== undefined && (
           <span className="completion-duration">{formatDuration(durationMs)}</span>
@@ -43,18 +47,20 @@ export function CompletionSummaryCard({
 
       {steps && steps.length > 0 && (
         <ul className="completion-steps">
-          {steps.map((step, i) => (
-            <li
-              key={i}
-              className={`completion-step completion-step-${step.status}`}
-            >
-              <span className="completion-step-icon">{stepIconForStatus(step.status)}</span>
-              <span className="completion-step-label">{step.label}</span>
-              {step.detail && (
-                <span className="completion-step-detail">{step.detail}</span>
-              )}
-            </li>
-          ))}
+          {steps.map((step, i) => {
+            const status = normalizeStatus(step.status);
+            return (
+              <li key={i} className={`completion-step completion-step-${status}`}>
+                <span className="completion-step-icon" aria-hidden>
+                  {STEP_GLYPH[status]}
+                </span>
+                <span className="completion-step-label">{step.label}</span>
+                {step.detail && (
+                  <span className="completion-step-detail">{step.detail}</span>
+                )}
+              </li>
+            );
+          })}
         </ul>
       )}
     </div>

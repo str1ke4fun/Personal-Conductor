@@ -195,24 +195,33 @@ impl ConflictLockPolicy {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentMemberStatus {
-    Active,
-    Paused,
+    Idle,
+    Running,
+    Completed,
+    Blocked,
+    Failed,
     Stopped,
 }
 
 impl AgentMemberStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Active => "active",
-            Self::Paused => "paused",
+            Self::Idle => "idle",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Blocked => "blocked",
+            Self::Failed => "failed",
             Self::Stopped => "stopped",
         }
     }
 
     pub fn from_str(value: &str) -> anyhow::Result<Self> {
         match value {
-            "active" => Ok(Self::Active),
-            "paused" => Ok(Self::Paused),
+            "idle" => Ok(Self::Idle),
+            "running" => Ok(Self::Running),
+            "completed" => Ok(Self::Completed),
+            "blocked" => Ok(Self::Blocked),
+            "failed" => Ok(Self::Failed),
             "stopped" => Ok(Self::Stopped),
             other => bail!("unknown agent member status: {other}"),
         }
@@ -458,7 +467,7 @@ pub async fn add_member(input: AddAgentTeamMemberInput) -> anyhow::Result<AgentT
         },
         run_id: input.run_id,
         cwd: input.cwd,
-        status: AgentMemberStatus::Active,
+        status: AgentMemberStatus::Idle,
         subscriptions: input.subscriptions,
         created_at: now,
         updated_at: now,
@@ -491,9 +500,24 @@ pub async fn set_member_status(
     status: AgentMemberStatus,
 ) -> anyhow::Result<AgentTeamMember> {
     let mut member = get_member(team_id, agent_id).await?;
+    let old_status = member.status.as_str().to_string();
+    let task_id = member
+        .metadata_json
+        .as_ref()
+        .and_then(|m| m.get("task_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     member.status = status;
     member.updated_at = Utc::now();
     upsert_member(&member).await?;
+    let _ = crate::events::emit_agent_team_member_status_changed(
+        team_id,
+        agent_id,
+        &old_status,
+        member.status.as_str(),
+        task_id.as_deref(),
+    )
+    .await;
     Ok(member)
 }
 
@@ -520,7 +544,35 @@ pub async fn bind_member_run_to_task(
     member.updated_at = Utc::now();
     member.metadata_json = merge_metadata(member.metadata_json.take(), metadata_patch)?;
     upsert_member(&member).await?;
+    let _ =
+        crate::events::emit_agent_team_member_run_bound(team_id, &member.agent_id, run_id).await;
     Ok(member)
+}
+
+/// Find a team member whose metadata contains the given task_id.
+/// Returns (team_id, member) if found. Searches all teams. (P0-C)
+pub async fn find_member_by_task_id(
+    task_id: &str,
+) -> anyhow::Result<Option<(String, AgentTeamMember)>> {
+    let pool = crate::db::pool().await?;
+    let row = sqlx::query(
+        r#"SELECT team_id, agent_id, role, run_id, cwd, status, subscriptions_json,
+                  metadata_json, created_at, updated_at
+           FROM agent_team_members
+           WHERE json_extract(metadata_json, '$.task_id') = ?1
+           LIMIT 1"#,
+    )
+    .bind(task_id)
+    .fetch_optional(&pool)
+    .await?;
+
+    if let Some(row) = row {
+        let member = row_to_member(row)?;
+        let team_id = member.team_id.clone();
+        Ok(Some((team_id, member)))
+    } else {
+        Ok(None)
+    }
 }
 
 pub async fn send_message(
@@ -676,6 +728,7 @@ pub async fn transition_team_lifecycle(
     new_lifecycle: AgentTeamLifecycle,
 ) -> anyhow::Result<AgentTeam> {
     let mut team = get_team(team_id).await?;
+    let old_lifecycle = team.lifecycle.as_str().to_string();
     validate_transition(&team.lifecycle, &new_lifecycle)?;
     if new_lifecycle == AgentTeamLifecycle::Executing {
         ensure_active_executor(team_id).await?;
@@ -683,6 +736,13 @@ pub async fn transition_team_lifecycle(
     team.lifecycle = new_lifecycle;
     team.updated_at = Utc::now();
     upsert_team(&team).await?;
+    let _ = crate::events::emit_agent_team_lifecycle_changed(
+        team_id,
+        &old_lifecycle,
+        team.lifecycle.as_str(),
+        None,
+    )
+    .await;
     Ok(team)
 }
 
@@ -1777,7 +1837,7 @@ mod tests {
             role: "assistant".to_string(),
             run_id: None,
             cwd: None,
-            status: AgentMemberStatus::Active,
+            status: AgentMemberStatus::Idle,
             subscriptions: vec![],
             created_at: Utc::now(),
             updated_at: Utc::now(),

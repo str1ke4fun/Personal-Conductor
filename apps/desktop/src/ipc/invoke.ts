@@ -2,7 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 
 export type TaskStatus = 'pending' | 'in_progress' | 'passed' | 'rejected' | 'skipped';
-export type SettingsTab = 'llm' | 'reminders' | 'pet' | 'persona' | 'capabilities' | 'proactive';
+export type SettingsTab = 'llm' | 'reminders' | 'pet' | 'persona' | 'capabilities' | 'proactive' | 'models' | 'theme';
 
 export interface LlmSettings {
   provider: string;
@@ -104,6 +104,7 @@ export interface PetExpressionPayload {
   activity_variant: string;
   mood_zone: MoodZone;
   relationship_stage: RelationshipStage;
+  affection_value?: number;
   pet_state: string;
 }
 
@@ -234,6 +235,39 @@ export interface ChatMessageV2 {
   seq?: number;
 }
 
+export interface ChatTurnEvent {
+  id: string;
+  turn_id: string;
+  session_id?: string | null;
+  workspace_id?: string | null;
+  request_id: string;
+  seq: number;
+  event_type: string;
+  phase?: string | null;
+  actor_kind: string;
+  actor_id?: string | null;
+  payload_json: unknown;
+  created_at: string;
+}
+
+export interface ChatMessageProjection {
+  id: string;
+  turn_id: string;
+  message_id?: string | null;
+  session_id?: string | null;
+  workspace_id?: string | null;
+  role: 'user' | 'assistant' | string;
+  projection_kind: string;
+  status: string;
+  visibility: string;
+  plain_text?: string | null;
+  content_blocks_json: ContentBlock[] | unknown;
+  source_event_id?: string | null;
+  seq: number;
+  created_at: string;
+  updated_at: string;
+}
+
 /**
  * Parse the `content` field of a legacy `ChatMessage` into `ContentBlock[]`.
  *
@@ -341,7 +375,7 @@ export type AgentTeamLifecycle =
   | 'accepted'
   | 'rework_required'
   | 'archived';
-export type AgentMemberStatus = 'active' | 'paused' | 'stopped';
+export type AgentMemberStatus = 'idle' | 'running' | 'completed' | 'blocked' | 'failed' | 'stopped';
 export type AgentMessageKind =
   | 'message'
   | 'broadcast'
@@ -736,6 +770,12 @@ export const api = {
   listChatSessions: (limit?: number) => invoke<ChatSessionSummary[]>('list_chat_sessions', { limit }),
   getChatSessionMessages: (sessionId: string, limit?: number) =>
     invoke<ChatMessage[]>('get_chat_session_messages', { sessionId, limit }),
+  getChatSessionMessagesV2: (sessionId: string, limit?: number) =>
+    invoke<ChatMessageV2[]>('get_chat_session_messages_v2', { sessionId, limit }),
+  getChatTurnEvents: (requestId: string) =>
+    invoke<ChatTurnEvent[]>('get_chat_turn_events', { requestId }),
+  getChatMessageProjections: (sessionId: string, limit?: number) =>
+    invoke<ChatMessageProjection[]>('get_chat_message_projections', { sessionId, limit }),
   renameChatSession: (sessionId: string, title: string) =>
     invoke<void>('rename_chat_session', { sessionId, title }),
   archiveChatSession: (sessionId: string) =>
@@ -759,6 +799,7 @@ export const api = {
   listToolCalls: (filter: {
     sessionId?: string | null;
     workspaceId?: string | null;
+    turnId?: string | null;
     llmToolCallId?: string | null;
     toolId?: string | null;
     status?: string | null;
@@ -769,6 +810,7 @@ export const api = {
     invoke<ToolCall[]>('list_tool_calls', {
       sessionId: filter.sessionId ?? null,
       workspaceId: filter.workspaceId ?? null,
+      turnId: filter.turnId ?? null,
       llmToolCallId: filter.llmToolCallId ?? null,
       toolId: filter.toolId ?? null,
       status: filter.status ?? null,
@@ -882,6 +924,12 @@ export const api = {
   memoryUpdateStatus: (id: string, status: string) => invoke<boolean>('memory_update_status', { id, status }),
   memoryForget: (id: string) => invoke<boolean>('memory_forget', { id }),
   memoryRebuildEmbeddings: () => invoke<number>('memory_rebuild_embeddings'),
+  /** Update the value field of a memory entry by its ID. */
+  memoryUpdate: (id: string, value: string) => invoke<boolean>('memory_update', { id, value }),
+  /** Hard-delete a memory entry and its associated chunks/embeddings by ID. */
+  memoryDelete: (id: string) => invoke<boolean>('memory_delete', { id }),
+  /** Archive a memory entry by its ID (sets status = 'archived'). */
+  memoryArchive: (id: string) => invoke<boolean>('memory_archive', { id }),
   getMusicState: () => invoke<MusicInfo>('get_music_state'),
   checkInitiative: () => invoke<string | null>('check_initiative'),
   recordActivity: () => invoke<void>('record_activity'),
@@ -1102,3 +1150,287 @@ export const listWorkspaceActivityProjection = (workspaceId: string, limit?: num
     workspaceId,
     limit: limit ?? null,
   });
+
+// ── LlmProfile types and API (Task E-1) ─────────────────────────────────
+
+export type LlmTransport = 'http_api' | 'claude_cli' | 'codex_cli' | 'mcp_server';
+export type LlmProvider = 'openai' | 'anthropic' | 'local' | 'claude_cli' | 'codex_cli' | 'mcp_router';
+
+export interface LlmProfile {
+  id: string;
+  name: string;
+  provider: LlmProvider | string;
+  transport: LlmTransport | string;
+  model_id: string;
+  api_base_url: string;
+  api_key_encrypted?: string | null;
+  max_tokens: number;
+  temperature: number;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateLlmProfileInput {
+  name: string;
+  provider: LlmProvider | string;
+  model_id: string;
+  api_base_url: string;
+  api_key?: string | null;
+  max_tokens?: number | null;
+  temperature?: number | null;
+}
+
+export const listLlmProfiles = (): Promise<LlmProfile[]> =>
+  invoke<LlmProfile[]>('list_llm_profiles');
+
+export const createLlmProfile = (input: CreateLlmProfileInput): Promise<LlmProfile> =>
+  invoke<LlmProfile>('create_llm_profile', { input });
+
+export const deleteLlmProfile = (id: string): Promise<void> =>
+  invoke<void>('delete_llm_profile', { id });
+
+// ── Runtime API (hint injection + graph snapshot) — Task E-2 ─────────────────
+
+export interface RuntimeApiInfo {
+  baseUrl: string;
+  token: string;
+}
+
+export interface GoalHint {
+  id: string;
+  goal_id: string;
+  cycle_id?: string | null;
+  content: string;
+  hint_kind: string;
+  priority: number;
+  active: boolean;
+  status?: string;
+  created_at: string;
+  updated_at?: string;
+  expires_at?: string | null;
+}
+
+export interface GoalGraphFact {
+  id: string;
+  key: string;
+  summary: string;
+  category: string;
+  source_turn_id?: string | null;
+  source_tool_call_id?: string | null;
+}
+
+export interface GoalGraphIntent {
+  id: string;
+  title: string;
+  status: string;
+  instruction: string;
+}
+
+export interface GoalGraphTurn {
+  id?: string;
+  request_id: string;
+  agent_task_id?: string | null;
+  status: string;
+  started_at: string;
+}
+
+export interface GoalGraphEdge {
+  id: string;
+  from: string;
+  to: string;
+  relation: string;
+  label?: string;
+}
+
+export interface GoalGraphSnapshot {
+  goal_id: string;
+  goal_title?: string;
+  objective?: string;
+  graph_hash?: string;
+  facts: GoalGraphFact[];
+  intents: GoalGraphIntent[];
+  facts_count: number;
+  open_intents_count: number;
+  hints: GoalHint[];
+  edges: GoalGraphEdge[];
+  recent_events: unknown[];
+  events_count?: number;
+  chat_turn_request_id?: string | null;
+  chat_turn_request_ids: string[];
+  chat_turns: GoalGraphTurn[];
+}
+
+const OPEN_INTENT_STATUSES = new Set(['open', 'proposed', 'queued', 'claimed']);
+
+function asArray<T = unknown>(value: unknown): T[] {
+  return Array.isArray(value) ? (value as T[]) : [];
+}
+
+function asText(value: unknown, fallback = ''): string {
+  if (typeof value === 'string') return value;
+  if (value === null || value === undefined) return fallback;
+  return String(value);
+}
+
+function asNumber(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
+}
+
+function normalizeGoalHint(raw: any, goalId = ''): GoalHint {
+  const explicitActive = typeof raw?.active === 'boolean' ? raw.active : undefined;
+  const status = asText(raw?.status, explicitActive === false ? 'dismissed' : 'active');
+  return {
+    id: asText(raw?.id),
+    goal_id: asText(raw?.goal_id, goalId),
+    cycle_id: raw?.cycle_id ?? null,
+    content: asText(raw?.content),
+    hint_kind: asText(raw?.hint_kind ?? raw?.kind, 'user'),
+    priority: asNumber(raw?.priority) ?? 0,
+    active: explicitActive ?? status === 'active',
+    status,
+    created_at: asText(raw?.created_at),
+    updated_at: raw?.updated_at ? asText(raw.updated_at) : undefined,
+    expires_at: raw?.expires_at ?? null,
+  };
+}
+
+function normalizeGraphFact(raw: any, index: number): GoalGraphFact {
+  const key = asText(raw?.key ?? raw?.kind, `fact-${index + 1}`);
+  return {
+    id: asText(raw?.id, key),
+    key,
+    summary: asText(raw?.summary ?? raw?.content ?? raw?.value),
+    category: asText(raw?.category ?? raw?.kind, 'fact'),
+    source_turn_id: raw?.source_turn_id ?? null,
+    source_tool_call_id: raw?.source_tool_call_id ?? null,
+  };
+}
+
+function normalizeGraphIntent(raw: any, index: number): GoalGraphIntent {
+  return {
+    id: asText(raw?.id, `intent-${index + 1}`),
+    title: asText(raw?.title),
+    status: asText(raw?.status, 'unknown'),
+    instruction: asText(raw?.instruction),
+  };
+}
+
+function normalizeGraphTurn(raw: any): GoalGraphTurn {
+  return {
+    id: raw?.id ? asText(raw.id) : undefined,
+    request_id: asText(raw?.request_id),
+    agent_task_id: raw?.agent_task_id ?? null,
+    status: asText(raw?.status, 'unknown'),
+    started_at: asText(raw?.started_at),
+  };
+}
+
+function normalizeGraphEdge(raw: any, index: number): GoalGraphEdge {
+  const from = asText(raw?.from);
+  const to = asText(raw?.to);
+  const relation = asText(raw?.relation, 'related');
+  return {
+    id: asText(raw?.id, `edge-${index + 1}:${from}:${to}:${relation}`),
+    from,
+    to,
+    relation,
+    label: raw?.label ? asText(raw.label) : undefined,
+  };
+}
+
+async function getRuntimeApiInfo(): Promise<RuntimeApiInfo> {
+  return invoke<RuntimeApiInfo>('get_runtime_api_info');
+}
+
+async function runtimeFetch<T>(path: string, options?: RequestInit): Promise<T> {
+  const info = await getRuntimeApiInfo();
+  const url = `${info.baseUrl}${path}`;
+  const res = await fetch(url, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${info.token}`,
+      ...(options?.headers ?? {}),
+    },
+  });
+  if (!res.ok) {
+    throw new Error(`Runtime API ${options?.method ?? 'GET'} ${path} failed: ${res.status}`);
+  }
+  if (res.status === 204) return undefined as unknown as T;
+  return res.json() as Promise<T>;
+}
+
+export async function listGoalHints(goalId: string): Promise<GoalHint[]> {
+  const raw = await runtimeFetch<any[]>(`/runtime/goals/${goalId}/hints`);
+  return asArray(raw).map((hint) => normalizeGoalHint(hint, goalId));
+}
+
+export async function createGoalHint(
+  goalId: string,
+  content: string,
+  hintKind = 'user',
+  priority = 5,
+): Promise<GoalHint> {
+  const raw = await runtimeFetch<any>(`/runtime/goals/${goalId}/hints`, {
+    method: 'POST',
+    body: JSON.stringify({ content, hint_kind: hintKind, priority }),
+  });
+  return normalizeGoalHint(raw, goalId);
+}
+
+export async function dismissGoalHint(goalId: string, hintId: string): Promise<void> {
+  return runtimeFetch<void>(`/runtime/goals/${goalId}/hints/${hintId}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function getGoalGraph(goalId: string): Promise<GoalGraphSnapshot> {
+  // Primary path: HTTP runtime API. Fallback: direct Tauri command (bypasses
+  // the local HTTP server so it works even when the runtime port is stale).
+  let raw: any;
+  try {
+    raw = await runtimeFetch<any>(`/runtime/goals/${goalId}/graph?format=json`);
+  } catch {
+    raw = await invoke<any>('get_goal_graph', { goalId });
+  }
+  const facts = asArray(raw.facts).map(normalizeGraphFact);
+  const intents = asArray(raw.intents).map(normalizeGraphIntent);
+  const hints = asArray(raw.hints).map((hint) => normalizeGoalHint(hint, goalId));
+  const edges = asArray(raw.edges).map(normalizeGraphEdge).filter((edge) => edge.from && edge.to);
+  const recentEvents = asArray(raw.recent_events ?? raw.events);
+  const openIntents = asArray(raw.open_intents);
+  const chatTurns = asArray(raw.chat_turns).map(normalizeGraphTurn).filter((turn) => turn.request_id);
+  const requestIds =
+    asArray(raw.chat_turn_request_ids).map((id) => asText(id)).filter(Boolean);
+  if (requestIds.length === 0 && raw.chat_turn_request_id) {
+    requestIds.push(asText(raw.chat_turn_request_id));
+  }
+  const openIntentsCount =
+    asNumber(raw.open_intents_count) ??
+    (Array.isArray(raw.open_intents) ? openIntents.length : undefined) ??
+    intents.filter((intent) => OPEN_INTENT_STATUSES.has(intent.status)).length;
+
+  return {
+    goal_id: raw.goal_id ?? goalId,
+    goal_title: raw.goal_title,
+    objective: raw.objective,
+    graph_hash: raw.graph_hash,
+    facts,
+    intents,
+    facts_count: facts.length || asNumber(raw.facts_count) || 0,
+    open_intents_count: openIntentsCount,
+    hints,
+    edges,
+    recent_events: recentEvents,
+    events_count: asNumber(raw.events_count) ?? recentEvents.length,
+    chat_turn_request_id: raw.chat_turn_request_id ?? requestIds[0] ?? null,
+    chat_turn_request_ids: requestIds,
+    chat_turns: chatTurns,
+  };
+}

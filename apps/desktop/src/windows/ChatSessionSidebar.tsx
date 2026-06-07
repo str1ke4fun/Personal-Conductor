@@ -130,7 +130,7 @@ export function ChatSessionSidebar({
   }, [refresh]);
 
   useEffect(() => {
-    if (activeSessionId !== undefined) {
+    if (activeSessionId !== null) {
       void refresh();
     }
   }, [activeSessionId, refresh]);

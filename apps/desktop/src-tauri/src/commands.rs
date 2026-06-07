@@ -1,10 +1,13 @@
 use conductor_core::{
     affection, agent_runs, agent_teams, avatar,
-    chat::{self, ChatCapability, ChatMessage, ChatReply, ChatTaskMode},
+    chat::{
+        self, ChatCapability, ChatMessage, ChatMessageV2, ChatReply, ChatTaskMode,
+        ChatTurnEventRecord, MessageProjectionRecord,
+    },
     command_runs,
     config::{self, CoreConfig},
-    connectors, events, expression, goal_tasks, goals, heartbeat, initiative, memory, music,
-    persona, projection,
+    connectors, events, expression, goal_hints, goal_tasks, goals, heartbeat, initiative,
+    llm_profiles, memory, music, persona, projection,
     proposals::{self, Proposal, ProposalStatus},
     scene, skills, tasklist,
     tasks::{self, Task, TaskStatus},
@@ -168,6 +171,29 @@ pub async fn get_chat_session_messages(
 }
 
 #[tauri::command]
+pub async fn get_chat_session_messages_v2(
+    session_id: String,
+    limit: Option<u32>,
+) -> Result<Vec<ChatMessageV2>, AppError> {
+    Ok(chat::get_chat_session_messages_v2(&session_id, limit).await?)
+}
+
+#[tauri::command]
+pub async fn get_chat_turn_events(
+    request_id: String,
+) -> Result<Vec<ChatTurnEventRecord>, AppError> {
+    Ok(chat::list_turn_events_by_request(&request_id).await?)
+}
+
+#[tauri::command]
+pub async fn get_chat_message_projections(
+    session_id: String,
+    limit: Option<u32>,
+) -> Result<Vec<MessageProjectionRecord>, AppError> {
+    Ok(chat::list_message_projections_by_session(&session_id, limit).await?)
+}
+
+#[tauri::command]
 pub async fn rename_chat_session(session_id: String, title: String) -> Result<(), AppError> {
     Ok(chat::rename_chat_session(&session_id, &title).await?)
 }
@@ -249,6 +275,7 @@ pub async fn get_tool_call(id: String) -> Result<tool_calls::ToolCall, AppError>
 pub async fn list_tool_calls(
     session_id: Option<String>,
     workspace_id: Option<String>,
+    turn_id: Option<String>,
     llm_tool_call_id: Option<String>,
     tool_id: Option<String>,
     status: Option<String>,
@@ -259,6 +286,7 @@ pub async fn list_tool_calls(
     Ok(tool_calls::list(tool_calls::ToolCallFilter {
         session_id,
         workspace_id,
+        turn_id,
         llm_tool_call_id,
         tool_id,
         status,
@@ -1106,6 +1134,55 @@ pub async fn get_emotion_summary() -> Result<EmotionSummary, AppError> {
     })
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelationshipStats {
+    pub days_known: u32,
+    pub conversation_count: u32,
+    pub task_count: u32,
+    pub affection_level: u32,
+    pub last_upgrade_date: Option<String>,
+}
+
+#[tauri::command]
+pub async fn get_relationship_stats() -> Result<RelationshipStats, AppError> {
+    // Days since first chat session
+    let sessions = chat::list_chat_sessions(None).await?;
+    let days_known = sessions
+        .iter()
+        .map(|s| s.created_at)
+        .min()
+        .map(|earliest| {
+            let now = chrono::Utc::now();
+            let duration = now.signed_duration_since(earliest);
+            duration.num_days().max(0) as u32
+        })
+        .unwrap_or(0);
+
+    // Count of chat sessions as conversation_count
+    let conversation_count = sessions.len() as u32;
+
+    // Count of accepted/passed agent tasks
+    let task_file = tasks::load().await?;
+    let task_count = task_file
+        .tasks
+        .iter()
+        .filter(|t| t.status == TaskStatus::Passed)
+        .count() as u32;
+
+    // Current affection score
+    let affection_state = affection::load().await?;
+    let affection_level = affection_state.value;
+
+    Ok(RelationshipStats {
+        days_known,
+        conversation_count,
+        task_count,
+        affection_level,
+        last_upgrade_date: None,
+    })
+}
+
 #[tauri::command]
 pub async fn memory_set(key: String, value: String, category: String) -> Result<(), AppError> {
     Ok(memory::set(&key, &value, &category).await.map(|_| ())?)
@@ -1429,6 +1506,24 @@ pub async fn memory_rebuild_embeddings() -> Result<u64, AppError> {
     Ok(memory::rebuild_embeddings().await?)
 }
 
+/// Update the `value` field of a memory entry by its ID.
+#[tauri::command]
+pub async fn memory_update(id: String, value: String) -> Result<bool, AppError> {
+    Ok(memory::update_value_by_id(&id, &value).await?)
+}
+
+/// Hard-delete a memory entry and its chunks/embeddings by ID.
+#[tauri::command]
+pub async fn memory_delete(id: String) -> Result<bool, AppError> {
+    Ok(memory::delete_by_id(&id).await?)
+}
+
+/// Archive a memory entry by its ID (sets status = 'archived').
+#[tauri::command]
+pub async fn memory_archive(id: String) -> Result<bool, AppError> {
+    Ok(memory::update_status_by_id(&id, "archived").await?)
+}
+
 // ── Skill Package commands (TASK-071) ────────────────────────────────────
 
 #[tauri::command]
@@ -1717,6 +1812,110 @@ pub async fn list_workspace_activity_projection(
     limit: Option<u32>,
 ) -> Result<projection::WorkspaceActivityProjection, AppError> {
     Ok(projection::list_workspace_activities(&workspace_id, limit).await?)
+}
+
+// ── LlmProfile commands (Task E-1) ──────────────────────────────────────
+
+#[tauri::command]
+pub async fn list_llm_profiles() -> Result<Vec<llm_profiles::LlmProfile>, AppError> {
+    Ok(llm_profiles::list_profiles(false).await?)
+}
+
+#[derive(serde::Deserialize)]
+pub struct CreateLlmProfileInput {
+    pub name: String,
+    pub provider: String,
+    pub model_id: String,
+    pub api_base_url: String,
+    pub api_key: Option<String>,
+    pub max_tokens: Option<i64>,
+    pub temperature: Option<f64>,
+}
+
+#[tauri::command]
+pub async fn create_llm_profile(
+    input: CreateLlmProfileInput,
+) -> Result<llm_profiles::LlmProfile, AppError> {
+    Ok(llm_profiles::create_profile(
+        &input.name,
+        &input.provider,
+        &input.model_id,
+        &input.api_base_url,
+        input.api_key.as_deref(),
+        input.max_tokens.unwrap_or(4096),
+        input.temperature.unwrap_or(0.7),
+    )
+    .await?)
+}
+
+#[tauri::command]
+pub async fn delete_llm_profile(id: String) -> Result<(), AppError> {
+    Ok(llm_profiles::delete_profile(&id).await?)
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeApiInfo {
+    pub base_url: String,
+    pub token: String,
+}
+
+#[tauri::command]
+pub async fn get_runtime_api_info() -> Result<RuntimeApiInfo, AppError> {
+    let path = conductor_core::paths::Paths::runtime_api_state_json();
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|e| AppError::Internal(format!("runtime-api state not found: {e}")))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| AppError::Internal(format!("runtime-api state parse error: {e}")))?;
+    let base_url = value["base_url"]
+        .as_str()
+        .ok_or_else(|| AppError::Internal("runtime-api state missing base_url".into()))?
+        .to_string();
+    let token = value["token"]
+        .as_str()
+        .ok_or_else(|| AppError::Internal("runtime-api state missing token".into()))?
+        .to_string();
+    Ok(RuntimeApiInfo { base_url, token })
+}
+
+// ── Goal hints commands (E-2) ─────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn list_goal_hints(goal_id: String) -> Result<Vec<goal_hints::GoalHint>, AppError> {
+    Ok(goal_hints::list_active_hints(&goal_id, None).await?)
+}
+
+#[tauri::command]
+pub async fn create_goal_hint(
+    goal_id: String,
+    content: String,
+    hint_kind: Option<String>,
+    _priority: Option<i64>,
+) -> Result<goal_hints::GoalHint, AppError> {
+    Ok(goal_hints::create_hint(
+        &goal_id,
+        None,
+        hint_kind.as_deref().unwrap_or("user"),
+        &content,
+        None,
+    )
+    .await?)
+}
+
+#[tauri::command]
+pub async fn dismiss_goal_hint(hint_id: String) -> Result<(), AppError> {
+    goal_hints::dismiss_hint(&hint_id).await?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_goal_graph(
+    goal_id: String,
+) -> Result<conductor_core::runtime_api::GoalGraphSnapshot, AppError> {
+    conductor_core::runtime_api::build_goal_graph_snapshot(&goal_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("goal not found: {goal_id}")))
 }
 
 #[cfg(test)]

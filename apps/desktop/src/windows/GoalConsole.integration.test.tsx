@@ -6,6 +6,10 @@ const mocks = vi.hoisted(() => ({
   listGoalsMock: vi.fn(),
   getGoalCyclesMock: vi.fn(),
   listGoalTasksMock: vi.fn(),
+  listGoalHintsMock: vi.fn(),
+  getGoalGraphMock: vi.fn(),
+  createGoalHintMock: vi.fn(),
+  dismissGoalHintMock: vi.fn(),
   listActiveHeartbeatsMock: vi.fn(),
   listenMock: vi.fn(),
 }));
@@ -20,6 +24,10 @@ vi.mock('../ipc/invoke', () => ({
   listGoals: mocks.listGoalsMock,
   getGoalCycles: mocks.getGoalCyclesMock,
   listGoalTasks: mocks.listGoalTasksMock,
+  listGoalHints: mocks.listGoalHintsMock,
+  getGoalGraph: mocks.getGoalGraphMock,
+  createGoalHint: mocks.createGoalHintMock,
+  dismissGoalHint: mocks.dismissGoalHintMock,
   listActiveHeartbeats: mocks.listActiveHeartbeatsMock,
 }));
 
@@ -117,10 +125,24 @@ describe('GoalConsole integration', () => {
         expires_at: '2026-05-31T00:08:00Z',
       },
     ]);
+    mocks.listGoalHintsMock.mockResolvedValue([]);
+    mocks.getGoalGraphMock.mockResolvedValue({
+      goal_id: 'goal-1',
+      facts: [],
+      intents: [],
+      hints: [],
+      recent_events: [],
+      facts_count: 0,
+      open_intents_count: 0,
+      events_count: 0,
+      chat_turn_request_id: null,
+    });
+    mocks.createGoalHintMock.mockResolvedValue(undefined);
+    mocks.dismissGoalHintMock.mockResolvedValue(undefined);
   });
 
   it('stays read-only, filters to the active goal, and hides task ids/result refs', async () => {
-    render(<GoalConsole workspaceId="ws-1" goalId="goal-1" />);
+    const { container } = render(<GoalConsole workspaceId="ws-1" goalId="goal-1" />);
 
     await waitFor(() => {
       expect(mocks.listGoalTasksMock).toHaveBeenCalledWith('goal-1');
@@ -135,6 +157,6 @@ describe('GoalConsole integration', () => {
     expect(screen.getByText('waiting for follow-up guidance')).toBeTruthy();
     expect(screen.queryByText(/task-review/)).toBeNull();
     expect(screen.queryByText(/runs\/cargo-check\.txt/)).toBeNull();
-    expect(screen.queryAllByRole('button')).toHaveLength(0);
+    expect(container.querySelectorAll('.btn-action, .btn-primary')).toHaveLength(0);
   });
 });

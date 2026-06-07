@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type CSSProperties } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { api, type AppSettings, type AvatarId, type AvatarSettings, type MoodZone } from '../ipc/invoke';
 import type { PetVisualState } from './usePetVisualState';
+import { PetBody } from './pet/PetBody';
 
 const DEFAULT_AVATAR: AvatarSettings = {
   mode: 'video',
@@ -45,28 +46,6 @@ function moodToVisual(mood: MoodZone): VisualMood {
   }
 }
 
-// Activity groups for image mapping
-type ActivityGroup = 'idle' | 'thinking' | 'work' | 'command' | 'error';
-
-function activityToGroup(av: ActivityVariant): ActivityGroup {
-  switch (av) {
-    case 'idle':
-    case 'waiting_user':
-    case 'done':
-      return 'idle';
-    case 'thinking':
-    case 'reading':
-      return 'thinking';
-    case 'writing':
-    case 'tool_calling':
-      return 'work';
-    case 'agent_leading':
-      return 'command';
-    case 'error':
-      return 'error';
-  }
-}
-
 // Base manifest (activity-only, no mood) — backward compatible
 const AVATAR_MANIFEST: Record<string, AvatarAsset> = {
   // Document Secretary
@@ -97,9 +76,6 @@ const AVATAR_MANIFEST: Record<string, AvatarAsset> = {
 const MOOD_MANIFEST: Record<string, AvatarAsset> = {
   // Example entries (uncomment when images exist):
   // 'programmer:positive:idle': { src: '/avatar/programmer/happy_idle.png', scale: 1.2, align: 'bottom' },
-  // 'programmer:shy:error': { src: '/avatar/programmer/shy.png', scale: 1.2, align: 'bottom' },
-  // 'document_secretary:positive:idle': { src: '/avatar/document_secretary/happy_idle.png', scale: 1.18, align: 'bottom' },
-  // 'document_secretary:shy:error': { src: '/avatar/document_secretary/shy.png', scale: 1.18, align: 'bottom' },
 };
 
 function normalizeAvatar(settings?: Partial<AvatarSettings>): AvatarSettings {
@@ -154,6 +130,67 @@ function resolveImageAsset(
   return { src: DEFAULT_AVATAR.videoSrc, scale: 1 };
 }
 
+// ---------------------------------------------------------------------------
+// useResolvedAvatarSrc — returns just the image src for the current visual state.
+// Returns null when the avatar is the 'original' (video) variant.
+// ---------------------------------------------------------------------------
+export function useResolvedAvatarSrc(visualState: PetVisualState): string | null {
+  const [avatarId, setAvatarId] = useState<AvatarId>('original');
+  const [activityVariant, setActivityVariant] = useState<ActivityVariant>('idle');
+  const [moodZone, setMoodZone] = useState<MoodZone | undefined>(undefined);
+  const [lockedMainAvatar, setLockedMainAvatar] = useState(false);
+  const [lockedActivityVariant, setLockedActivityVariant] = useState(false);
+  const [imageFallback, setImageFallback] = useState<'mapped' | 'thinking'>('mapped');
+
+  useEffect(() => {
+    api.getCurrentAvatar()
+      .then((state) => {
+        setAvatarId(state.avatarId);
+        setActivityVariant((state.activityVariant as ActivityVariant) || 'idle');
+        setLockedMainAvatar(state.lockedMainAvatar);
+        setLockedActivityVariant(state.lockedActivityVariant);
+      })
+      .catch(() => {});
+
+    const unlistenAvatar = listen('pet_avatar_changed', () => {
+      api.getCurrentAvatar().then((state) => {
+        setLockedMainAvatar(state.lockedMainAvatar);
+        setLockedActivityVariant(state.lockedActivityVariant);
+      }).catch(() => {});
+    });
+
+    return () => {
+      unlistenAvatar.then((dispose) => dispose()).catch(() => {});
+    };
+  }, []);
+
+  useEffect(() => {
+    const isPlaceholder =
+      visualState.avatarId === 'original' &&
+      visualState.activityVariant === 'idle' &&
+      visualState.moodZone === undefined &&
+      visualState.petState === 'idle';
+    if (isPlaceholder && avatarId !== 'original') return;
+
+    setImageFallback('mapped');
+    if (!lockedMainAvatar) setAvatarId(visualState.avatarId as AvatarId);
+    if (!lockedActivityVariant) setActivityVariant(visualState.activityVariant);
+    setMoodZone(visualState.moodZone);
+  }, [visualState, avatarId, lockedMainAvatar, lockedActivityVariant]);
+
+  if (avatarId === 'original') return null;
+
+  const asset = imageFallback === 'mapped'
+    ? resolveImageAsset(avatarId, activityVariant, moodZone)
+    : (AVATAR_MANIFEST[`${avatarId}:thinking`] ?? { src: DEFAULT_AVATAR.videoSrc, scale: 1 });
+
+  return asset.src;
+}
+
+// ---------------------------------------------------------------------------
+// AvatarRenderer — full component kept for backward compat.
+// Original avatar → video element. Image avatars → PetBody.
+// ---------------------------------------------------------------------------
 interface AvatarRendererProps {
   visualState?: PetVisualState;
 }
@@ -164,7 +201,6 @@ export function AvatarRenderer({ visualState }: AvatarRendererProps) {
   const [activityVariant, setActivityVariant] = useState<ActivityVariant>('idle');
   const [moodZone, setMoodZone] = useState<MoodZone | undefined>(undefined);
   const [videoFailed, setVideoFailed] = useState(false);
-  const [imageFailed, setImageFailed] = useState(false);
   const [imageFallback, setImageFallback] = useState<'mapped' | 'thinking' | 'original'>('mapped');
   const [lockedMainAvatar, setLockedMainAvatar] = useState(false);
   const [lockedActivityVariant, setLockedActivityVariant] = useState(false);
@@ -191,7 +227,6 @@ export function AvatarRenderer({ visualState }: AvatarRendererProps) {
       setAvatar(normalizeAvatar(event.payload.pet.avatar));
     });
 
-    // Update lock states when avatar state changes (e.g. from settings panel lock toggles)
     const unlistenAvatar = listen('pet_avatar_changed', () => {
       api.getCurrentAvatar().then((state) => {
         setLockedMainAvatar(state.lockedMainAvatar);
@@ -212,19 +247,12 @@ export function AvatarRenderer({ visualState }: AvatarRendererProps) {
       visualState.activityVariant === 'idle' &&
       visualState.moodZone === undefined &&
       visualState.petState === 'idle';
-    if (isPlaceholderVisualState && avatarId !== 'original') {
-      return;
-    }
+    if (isPlaceholderVisualState && avatarId !== 'original') return;
+
     setVideoFailed(false);
-    setImageFailed(false);
     setImageFallback('mapped');
-    // Respect lock state: only update avatarId/activityVariant when not locked
-    if (!lockedMainAvatar) {
-      setAvatarId(visualState.avatarId as AvatarId);
-    }
-    if (!lockedActivityVariant) {
-      setActivityVariant(visualState.activityVariant);
-    }
+    if (!lockedMainAvatar) setAvatarId(visualState.avatarId as AvatarId);
+    if (!lockedActivityVariant) setActivityVariant(visualState.activityVariant);
     setMoodZone(visualState.moodZone);
   }, [visualState, avatarId, lockedMainAvatar, lockedActivityVariant]);
 
@@ -234,6 +262,7 @@ export function AvatarRenderer({ visualState }: AvatarRendererProps) {
     }
   }, [avatar.playbackRate, avatar.videoSrc]);
 
+  // Original avatar — video element
   if (avatarId === 'original') {
     return (
       <div className="avatar-video-frame">
@@ -258,16 +287,17 @@ export function AvatarRenderer({ visualState }: AvatarRendererProps) {
     );
   }
 
-  if (!imageFailed || imageFallback !== 'original') {
-    let src: string;
+  // Image avatar — resolve asset then delegate to PetBody
+  if (imageFallback !== 'original') {
+    let asset: AvatarAsset;
     if (imageFallback === 'mapped') {
-      src = resolveImageAsset(avatarId, activityVariant, moodZone).src;
+      asset = resolveImageAsset(avatarId, activityVariant, moodZone);
     } else {
       const thinkingKey = `${avatarId}:thinking`;
-      src = AVATAR_MANIFEST[thinkingKey]?.src || DEFAULT_AVATAR.videoSrc;
+      asset = AVATAR_MANIFEST[thinkingKey] ?? { src: DEFAULT_AVATAR.videoSrc, scale: 1 };
     }
 
-    const isVideoFallback = src === DEFAULT_AVATAR.videoSrc;
+    const isVideoFallback = asset.src === DEFAULT_AVATAR.videoSrc;
 
     if (isVideoFallback && imageFallback === 'thinking') {
       return (
@@ -287,32 +317,21 @@ export function AvatarRenderer({ visualState }: AvatarRendererProps) {
       );
     }
 
-    const asset = imageFallback === 'mapped'
-      ? resolveImageAsset(avatarId, activityVariant, moodZone)
-      : AVATAR_MANIFEST[`${avatarId}:thinking`] || { src, scale: 1 };
-
     return (
-      <div className="avatar-video-frame">
-        <img
-          key={`${avatarId}-${asset.src}`}
-          className={`avatar-video avatar-fit-contain avatar-align-${asset.align || 'center'}`}
-          src={asset.src}
+      <div
+        className={`avatar-video-frame avatar-align-${asset.align || 'center'}`}
+        style={{ '--avatar-scale': String(asset.scale) } as CSSProperties}
+      >
+        <PetBody
+          imageUrl={asset.src}
+          mood={moodZone}
           alt=""
-          draggable={false}
-          style={{ '--avatar-scale': String(asset.scale) } as CSSProperties}
-          onError={() => {
-            if (imageFallback === 'mapped') {
-              setImageFallback('thinking');
-            } else {
-              setImageFallback('original');
-              setImageFailed(true);
-            }
-          }}
         />
       </div>
     );
   }
 
+  // Final fallback — original video
   return (
     <div className="avatar-video-frame">
       <video

@@ -38,6 +38,7 @@ pub struct GoalCycle {
     pub orientation_json: Option<Value>,
     pub dispatch_plan_id: Option<String>,
     pub review_summary_ref: Option<String>,
+    pub last_graph_hash: Option<String>,
     pub started_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
@@ -442,6 +443,7 @@ pub async fn create_cycle(goal_id: &str, cycle_no: i64) -> anyhow::Result<GoalCy
         orientation_json: None,
         dispatch_plan_id: None,
         review_summary_ref: None,
+        last_graph_hash: None,
         started_at: now,
         updated_at: now,
         finished_at: None,
@@ -465,7 +467,7 @@ pub async fn get_cycle(cycle_id: &str) -> anyhow::Result<Option<GoalCycle>> {
     let row = sqlx::query(
         r#"SELECT id, goal_id, cycle_no, status, observe_snapshot_ref,
                   orientation_json, dispatch_plan_id, review_summary_ref,
-                  started_at, updated_at, finished_at
+                  last_graph_hash, started_at, updated_at, finished_at
            FROM goal_cycles WHERE id = ?"#,
     )
     .bind(cycle_id)
@@ -485,7 +487,7 @@ pub async fn list_cycles_by_goal(goal_id: &str) -> anyhow::Result<Vec<GoalCycle>
     let rows = sqlx::query(
         r#"SELECT id, goal_id, cycle_no, status, observe_snapshot_ref,
                   orientation_json, dispatch_plan_id, review_summary_ref,
-                  started_at, updated_at, finished_at
+                  last_graph_hash, started_at, updated_at, finished_at
            FROM goal_cycles
            WHERE goal_id = ?
            ORDER BY cycle_no DESC"#,
@@ -576,6 +578,69 @@ pub async fn set_cycle_review_summary_ref(
     Ok(cycle)
 }
 
+/// Read back the last stored graph hash for a cycle (None if never set).
+pub async fn get_cycle_hash(cycle_id: &str) -> anyhow::Result<Option<String>> {
+    let pool = db::pool().await?;
+    let hash: Option<String> =
+        sqlx::query_scalar("SELECT last_graph_hash FROM goal_cycles WHERE id = ?")
+            .bind(cycle_id)
+            .fetch_optional(&pool)
+            .await
+            .with_context(|| "get_cycle_hash")?
+            .flatten();
+    Ok(hash)
+}
+
+/// Persist a new graph hash for a cycle without changing its lifecycle phase.
+pub async fn set_cycle_hash(cycle_id: &str, hash: &str) -> anyhow::Result<()> {
+    let pool = db::pool().await?;
+    let now = Utc::now();
+    sqlx::query("UPDATE goal_cycles SET last_graph_hash = ?, updated_at = ? WHERE id = ?")
+        .bind(hash)
+        .bind(now.to_rfc3339())
+        .bind(cycle_id)
+        .execute(&pool)
+        .await
+        .with_context(|| "set_cycle_hash")?;
+    Ok(())
+}
+
+/// Persist a DispatchPlan to the dispatch_plans table and link it to the cycle. (S1)
+pub async fn create_dispatch_plan(
+    goal_id: &str,
+    cycle_id: &str,
+    tasks_json: &str,
+    summary: &str,
+) -> anyhow::Result<String> {
+    let pool = db::pool().await?;
+    let id = format!("dp-{}", uuid::Uuid::new_v4());
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"INSERT INTO dispatch_plans
+           (id, goal_id, cycle_id, status, summary, tasks_json, created_at)
+           VALUES (?1, ?2, ?3, 'proposed', ?4, ?5, ?6)"#,
+    )
+    .bind(&id)
+    .bind(goal_id)
+    .bind(cycle_id)
+    .bind(summary)
+    .bind(tasks_json)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .with_context(|| "create_dispatch_plan")?;
+
+    sqlx::query("UPDATE goal_cycles SET dispatch_plan_id = ?1, updated_at = ?2 WHERE id = ?3")
+        .bind(&id)
+        .bind(&now)
+        .bind(cycle_id)
+        .execute(&pool)
+        .await
+        .with_context(|| "set_cycle_dispatch_plan_id")?;
+
+    Ok(id)
+}
+
 // ── Row mapping helpers ──────────────────────────────────────────────────────
 
 fn row_to_goal(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<GoalRun> {
@@ -635,6 +700,7 @@ fn row_to_cycle(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<GoalCycle> {
             .transpose()?,
         dispatch_plan_id: row.try_get("dispatch_plan_id")?,
         review_summary_ref: row.try_get("review_summary_ref")?,
+        last_graph_hash: row.try_get("last_graph_hash")?,
         started_at,
         updated_at,
         finished_at,

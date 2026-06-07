@@ -1,5 +1,4 @@
 mod commands;
-mod cursor;
 #[cfg(debug_assertions)]
 mod dev_server;
 mod error;
@@ -14,7 +13,7 @@ use conductor_core::{
     runtime_api::{generate_runtime_token, RuntimeApiServer},
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use std::{path::Path, sync::Mutex};
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 
 #[cfg(windows)]
@@ -99,6 +98,71 @@ async fn persist_runtime_api_snapshot(snapshot: &RuntimeApiSnapshot) -> anyhow::
     )
     .await?;
     tokio::fs::write(Paths::runtime_token_txt(), format!("{}\n", snapshot.token)).await?;
+    Ok(())
+}
+
+async fn initialize_user_state_from_template(app: &AppHandle) -> anyhow::Result<()> {
+    let state_dir = conductor_core::paths::state();
+    tokio::fs::create_dir_all(&state_dir).await?;
+
+    let resource_dir = match app.path().resource_dir() {
+        Ok(path) => path,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to resolve bundled resource directory");
+            return Ok(());
+        }
+    };
+    let template_dir = resource_dir.join("state-template");
+    if !tokio::fs::try_exists(&template_dir).await.unwrap_or(false) {
+        tracing::warn!(
+            path = %template_dir.display(),
+            "bundled state template is not present"
+        );
+        return Ok(());
+    }
+
+    for file_name in [
+        "conductor.sqlite",
+        "config.json",
+        "desktop.json",
+        "tasks.json",
+        "tasks.md",
+    ] {
+        copy_template_file_if_missing(&template_dir, &state_dir, file_name).await?;
+    }
+
+    tokio::fs::create_dir_all(Paths::summaries_dir()).await?;
+    Ok(())
+}
+
+async fn copy_template_file_if_missing(
+    template_dir: &Path,
+    state_dir: &Path,
+    file_name: &str,
+) -> anyhow::Result<()> {
+    let destination = state_dir.join(file_name);
+    if tokio::fs::try_exists(&destination).await.unwrap_or(false) {
+        return Ok(());
+    }
+
+    let source = template_dir.join(file_name);
+    if !tokio::fs::try_exists(&source).await.unwrap_or(false) {
+        tracing::warn!(
+            path = %source.display(),
+            "state template file is not present"
+        );
+        return Ok(());
+    }
+
+    if let Some(parent) = destination.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::copy(&source, &destination).await?;
+    tracing::info!(
+        source = %source.display(),
+        destination = %destination.display(),
+        "initialized state file from bundled template"
+    );
     Ok(())
 }
 
@@ -193,6 +257,7 @@ fn main() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .setup(|app| {
             conductor_core::tools::register_builtin_tools();
+            tauri::async_runtime::block_on(initialize_user_state_from_template(app.handle()))?;
             tauri::async_runtime::block_on(register_builtin_connectors())?;
             tauri::async_runtime::block_on(start_runtime_api(app.handle()))?;
             tauri::async_runtime::spawn(async {
@@ -204,7 +269,6 @@ fn main() {
             });
             tray::build_tray(app.handle())?;
             worker::spawn(app.handle().clone());
-            cursor::spawn_cursor_watcher(app.handle().clone());
             window_state::apply_pet_window_state(app.handle());
             install_auxiliary_window_close_handlers(app.handle());
             if let Some(pet) = app.get_webview_window("pet") {
@@ -220,6 +284,9 @@ fn main() {
             commands::ensure_chat_session,
             commands::list_chat_sessions,
             commands::get_chat_session_messages,
+            commands::get_chat_session_messages_v2,
+            commands::get_chat_turn_events,
+            commands::get_chat_message_projections,
             commands::rename_chat_session,
             commands::archive_chat_session,
             commands::update_chat_session_workspace,
@@ -277,6 +344,7 @@ fn main() {
             commands::get_emotion_history,
             commands::get_affection_history,
             commands::get_emotion_summary,
+            commands::get_relationship_stats,
             commands::memory_set,
             commands::memory_get,
             commands::memory_get_by_category,
@@ -289,6 +357,9 @@ fn main() {
             commands::memory_update_status,
             commands::memory_forget,
             commands::memory_rebuild_embeddings,
+            commands::memory_update,
+            commands::memory_delete,
+            commands::memory_archive,
             commands::get_music_state,
             commands::check_initiative,
             commands::record_activity,
@@ -327,6 +398,14 @@ fn main() {
             commands::list_goal_events,
             commands::write_workspace_projection,
             commands::list_workspace_activity_projection,
+            commands::list_llm_profiles,
+            commands::create_llm_profile,
+            commands::delete_llm_profile,
+            commands::get_runtime_api_info,
+            commands::list_goal_hints,
+            commands::create_goal_hint,
+            commands::dismiss_goal_hint,
+            commands::get_goal_graph,
             window_state::load_pet_window_state,
             window_state::save_pet_window_state,
             set_pet_click_through,

@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/model-router-core",
+    "crates/model-router-mcp",
     "crates/conductor-core",
     "crates/conductor-cli",
     "crates/conductor-sense",
@@ -49,3 +51,11 @@ windows = { version = "0.61", features = [
     "Win32_System_SystemInformation",
     "Win32_Graphics_Gdi",
 ] }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+incremental = false

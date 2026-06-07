@@ -304,6 +304,40 @@ impl CodexAdapter {
                 &serde_json::to_value(ev).unwrap_or_default(),
             )
             .await;
+
+            // Write back terminal states to agent_tasks (mirrors claude_p adapter behaviour).
+            match ev {
+                RuntimeEvent::Completed {
+                    task_id,
+                    session_id: sid,
+                    ..
+                } => {
+                    let result_ref = format!("codex:session:{sid}");
+                    if let Err(e) =
+                        crate::goal_tasks::set_task_result_ref_review_ready(task_id, &result_ref)
+                            .await
+                    {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            error = %e,
+                            "codex_adapter: failed to write review_ready writeback"
+                        );
+                    }
+                }
+                RuntimeEvent::Failed { task_id, error, .. } => {
+                    let task = crate::goal_tasks::get_task(task_id).await.ok().flatten();
+                    if task.map(|t| t.status == "running").unwrap_or(false) {
+                        if let Err(e) = crate::goal_tasks::fail_task(task_id, error).await {
+                            tracing::warn!(
+                                task_id = %task_id,
+                                error = %e,
+                                "codex_adapter: failed to write failed writeback"
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
 
         Ok(event)

@@ -1,0 +1,55 @@
+/* ── Pet window styles (清和 PNG static display) ── */
+/* Animations disabled: real-world testing showed CSS breathe/glow degraded
+   perceived quality vs. clean static PNG. Re-enable selectively if needed. */
+
+/* Animatable custom properties (kept for future use, not active) */
+@property --breath {
+  syntax: '<number>';
+  inherits: false;
+  initial-value: 1;
+}
+@property --sway {
+  syntax: '<angle>';
+  inherits: false;
+  initial-value: 0deg;
+}
+@property --head-tilt {
+  syntax: '<angle>';
+  inherits: false;
+  initial-value: 0deg;
+}
+
+/* Keyframes (defined but not applied) */
+@keyframes pet-breathe {
+  0%, 100% { --breath: 1; }
+  50% { --breath: 1.02; }
+}
+@keyframes pet-sway {
+  0%, 100% { --sway: 0deg; }
+  30% { --sway: -1.5deg; }
+  70% { --sway: 1.5deg; }
+}
+@keyframes pet-blink {
+  0%, 90%, 100% { clip-path: inset(0 0 0 0 round 50%); }
+  94% { clip-path: inset(0 0 96% 0 round 50%); }
+  97% { clip-path: inset(0 0 0 0 round 50%); }
+}
+
+/* Base pet body — static, no animation */
+.pet-body {
+  transform-origin: bottom center;
+}
+
+/* Mood states: subtle brightness/saturation shifts only, no glow drop-shadow */
+.pet-body[data-mood="sad"]   { filter: saturate(0.85) brightness(0.92); }
+.pet-body[data-mood="quiet"] { filter: brightness(0.88); }
+
+/* Eye layer — static */
+.pet-eye-layer {
+  /* blink animation intentionally disabled */
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pet-body { animation: none; transform: none; }
+  .pet-eye-layer { animation: none; }
+}

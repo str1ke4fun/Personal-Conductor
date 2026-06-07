@@ -191,6 +191,88 @@ pub(super) fn plain_text_for_llm(content: &str) -> String {
     }
 }
 
+pub(super) fn user_visible_plain_text(content: &str) -> String {
+    let trimmed = content.trim();
+    if !trimmed.starts_with('[') {
+        return trimmed.to_string();
+    }
+
+    let Ok(blocks) = serde_json::from_str::<Vec<ContentBlock>>(trimmed) else {
+        return trimmed.to_string();
+    };
+
+    let text_parts = blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } if !text.trim().is_empty() => Some(text.trim().to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if !text_parts.is_empty() {
+        return text_parts.join("\n");
+    }
+
+    let fallback_parts = blocks
+        .into_iter()
+        .filter_map(|block| match block {
+            ContentBlock::CapabilityRequest { request } => Some(request.reason),
+            ContentBlock::Plan {
+                title,
+                steps,
+                write_scope,
+                ..
+            } => Some(plan_block_plain_text(title, steps, write_scope)),
+            ContentBlock::Completion { title, summary, .. } => Some(match summary {
+                Some(summary) if !summary.trim().is_empty() => {
+                    format!("{title}\n{}", summary.trim())
+                }
+                _ => title,
+            }),
+            ContentBlock::Blocked {
+                title,
+                reason,
+                action_items,
+            } => {
+                let mut parts = vec![title, reason];
+                if !action_items.is_empty() {
+                    parts.push(format!("Action needed: {}", action_items.join("; ")));
+                }
+                Some(parts.join("\n"))
+            }
+            ContentBlock::RuntimeProjection { .. }
+            | ContentBlock::Thinking { .. }
+            | ContentBlock::ToolUse { .. }
+            | ContentBlock::ToolResult { .. }
+            | ContentBlock::Text { .. } => None,
+        })
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>();
+
+    fallback_parts.join("\n")
+}
+
+fn plan_block_plain_text(title: String, steps: Vec<PlanStep>, write_scope: Vec<String>) -> String {
+    let mut parts = vec![format!("Plan: {title}")];
+    if !steps.is_empty() {
+        parts.push(
+            steps
+                .into_iter()
+                .map(|step| match step.detail {
+                    Some(detail) if !detail.trim().is_empty() => {
+                        format!("- {}: {}", step.title.trim(), detail.trim())
+                    }
+                    _ => format!("- {}", step.title.trim()),
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+    if !write_scope.is_empty() {
+        parts.push(format!("Write scope: {}", write_scope.join(", ")));
+    }
+    parts.join("\n")
+}
+
 pub(super) fn extract_plan_block(final_content: &str, status: &str) -> Option<ContentBlock> {
     let trimmed = final_content.trim();
     if trimmed.is_empty() {
@@ -443,6 +525,41 @@ fn summarize_written_paths(tool_records: &[ToolCallRecord]) -> Vec<String> {
     paths
 }
 
+#[cfg(any(test, feature = "tauri-events"))]
+fn truncate_json_preview(value: &str, max_chars: usize) -> String {
+    let char_count = value.chars().count();
+    if char_count <= max_chars {
+        return value.to_string();
+    }
+    let mut preview: String = value.chars().take(max_chars).collect();
+    preview.push_str("...(truncated)");
+    preview
+}
+
+#[cfg(any(test, feature = "tauri-events"))]
+fn tool_input_block_from_arguments(arguments: &str) -> serde_json::Value {
+    match serde_json::from_str::<serde_json::Value>(arguments) {
+        Ok(value) if value.is_object() => value,
+        Ok(value) => serde_json::json!({
+            "_invalid_tool_arguments": true,
+            "reason": format!("expected JSON object, got {}", match value {
+                serde_json::Value::Null => "null",
+                serde_json::Value::Bool(_) => "boolean",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::String(_) => "string",
+                serde_json::Value::Array(_) => "array",
+                serde_json::Value::Object(_) => "object",
+            }),
+            "raw_arguments_preview": truncate_json_preview(arguments, 600),
+        }),
+        Err(error) => serde_json::json!({
+            "_invalid_tool_arguments": true,
+            "reason": error.to_string(),
+            "raw_arguments_preview": truncate_json_preview(arguments, 600),
+        }),
+    }
+}
+
 fn build_completion_block(
     final_content: &str,
     all_tool_records: &[ToolCallRecord],
@@ -516,17 +633,15 @@ pub(super) async fn append_chat_stage(
     started: std::time::Instant,
     payload: serde_json::Value,
 ) {
-    let _ = crate::events::append(
-        "chat",
-        "v2_stage",
-        &serde_json::json!({
-            "request_id": request_id,
-            "stage": stage,
-            "elapsed_ms": chat_elapsed_ms(started),
-            "payload": payload,
-        }),
-    )
-    .await;
+    let stage_payload = serde_json::json!({
+        "request_id": request_id,
+        "stage": stage,
+        "elapsed_ms": chat_elapsed_ms(started),
+        "payload": payload.clone(),
+    });
+    let _ = crate::events::append("chat", "v2_stage", &stage_payload).await;
+
+    let _ = super::turns::append_stage_event_by_request(request_id, stage, payload).await;
 }
 
 #[cfg(feature = "tauri-events")]
@@ -589,7 +704,7 @@ pub(super) fn build_content_blocks_for_db(
         content_blocks.push(ContentBlock::ToolUse {
             id: tc_id.clone(),
             name: record.tool_name.clone(),
-            input: serde_json::from_str(&record.arguments).unwrap_or(serde_json::json!({})),
+            input: tool_input_block_from_arguments(&record.arguments),
         });
         content_blocks.push(ContentBlock::ToolResult {
             tool_use_id: tc_id.clone(),
@@ -663,7 +778,7 @@ pub(super) async fn update_post_chat_avatar(
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_plan_block, truncate_tool_result};
+    use super::{extract_plan_block, tool_input_block_from_arguments, truncate_tool_result};
     use crate::chat::types::ContentBlock;
 
     #[test]
@@ -678,6 +793,17 @@ mod tests {
         let truncated = truncate_tool_result(input, 10);
         assert!(truncated.ends_with("...(truncated)"));
         assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn tool_input_block_preserves_invalid_argument_preview() {
+        let input =
+            tool_input_block_from_arguments(r#"{"file_path":"report.md","content":"unterminated"#);
+
+        assert_eq!(input["_invalid_tool_arguments"], true);
+        assert!(input["raw_arguments_preview"]
+            .as_str()
+            .is_some_and(|preview| preview.contains("file_path")));
     }
 
     #[test]
@@ -837,5 +963,56 @@ mod tests {
         let flattened = super::plain_text_for_llm(&content);
         assert_eq!(flattened, "Final reviewable conclusion");
         assert!(!flattened.contains("runtime_projection"));
+    }
+
+    #[test]
+    fn user_visible_plain_text_prefers_final_text_and_omits_tool_trace() {
+        let content = serde_json::to_string(&vec![
+            ContentBlock::Thinking {
+                thinking: "internal trace".to_string(),
+            },
+            ContentBlock::Completion {
+                title: "Completed".to_string(),
+                summary: Some("duplicated summary".to_string()),
+                steps: vec![],
+                duration_ms: None,
+            },
+            ContentBlock::Text {
+                text: "Final reviewable conclusion".to_string(),
+            },
+            ContentBlock::ToolResult {
+                tool_use_id: "tool-1".to_string(),
+                content: r#"{"text":"raw tool output"}"#.to_string(),
+                is_error: false,
+            },
+        ])
+        .expect("serialize blocks");
+
+        let flattened = super::user_visible_plain_text(&content);
+        assert_eq!(flattened, "Final reviewable conclusion");
+        assert!(!flattened.contains("raw tool output"));
+        assert!(!flattened.contains("duplicated summary"));
+    }
+
+    #[test]
+    fn user_visible_plain_text_uses_completion_when_no_text_block_exists() {
+        let content = serde_json::to_string(&vec![
+            ContentBlock::ToolResult {
+                tool_use_id: "tool-1".to_string(),
+                content: "raw tool output".to_string(),
+                is_error: false,
+            },
+            ContentBlock::Completion {
+                title: "Completed".to_string(),
+                summary: Some("Short user summary".to_string()),
+                steps: vec![],
+                duration_ms: None,
+            },
+        ])
+        .expect("serialize blocks");
+
+        let flattened = super::user_visible_plain_text(&content);
+        assert_eq!(flattened, "Completed\nShort user summary");
+        assert!(!flattened.contains("raw tool output"));
     }
 }
